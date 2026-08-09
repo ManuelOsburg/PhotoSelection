@@ -1,5 +1,7 @@
 # PhotoSelection
 
+*[English version](README.en.md) · Die Oberfläche ist deutsch.*
+
 Schlanke Foto-Voransicht für JPG und RAW. Durchblättern, per Tastendruck einem
 von neun Zielordnern zuordnen, am Ende alles in einem Rutsch kopieren oder
 verschieben. Eine Datei, keine Installation, kein Katalog.
