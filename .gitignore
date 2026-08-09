@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# Zuordnungen liegen beim jeweiligen Fotoordner, nicht im Projekt
+.photoselection.json
