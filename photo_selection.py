@@ -20,21 +20,52 @@ Verschiebe- und Entwicklungs-Vorgaenge.
 
 from __future__ import annotations
 
+import functools
 import io
 import json
 import math
 import os
 import queue
+import re
 import shutil
+import stat
+import sys
 import threading
+import time
 import tkinter as tk
+import traceback
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, fields
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tkinter import filedialog, messagebox, ttk
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageTk
+
+def _missing_dependency(exc: ImportError) -> None:
+    """Fehlendes Pflichtpaket melden - unter pythonw gaebe es sonst keinerlei Rueckmeldung."""
+    text = (f"Es fehlt ein benötigtes Paket: {exc.name or exc}\n\n"
+            "Installieren mit:\n    pip install -r requirements.txt")
+    print(text, file=sys.stderr)
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("PhotoSelection", text)
+        root.destroy()
+    except tk.TclError:
+        pass
+    raise SystemExit(1)
+
+
+try:
+    import numpy as np
+    from PIL import (Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps,
+                     ImageStat, ImageTk)
+except ImportError as _exc:
+    _missing_dependency(_exc)
+
+try:
+    from PIL import ImageCms
+except ImportError:  # Pillow ohne LittleCMS - Farbprofile werden dann ignoriert
+    ImageCms = None
 
 try:
     import rawpy
@@ -46,37 +77,157 @@ try:
 except ImportError:  # EXIF-Einblendung faellt dann auf das Vorschaubild zurueck
     exifread = None
 
+try:
+    from pillow_heif import register_heif_opener
+except ImportError:  # HEIF/HIF ist optional
+    register_heif_opener = None
+
 JPG_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
+if register_heif_opener is not None:
+    register_heif_opener()
+    JPG_EXT |= {".heic", ".heif", ".hif"}
 RAW_EXT = {
     ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".raf",
     ".orf", ".rw2", ".pef", ".dng", ".raw", ".rwl", ".srw", ".3fr", ".iiq",
     ".mos", ".mrw", ".x3f",
 }
 ALL_EXT = JPG_EXT | RAW_EXT
+# Begleitdateien anderer Programme - wandern mit der Aufnahme mit, damit z. B.
+# Lightroom (IMG.xmp), darktable (IMG.CR2.xmp), DxO (.dop) oder RawTherapee
+# (.pp3) ihre Bearbeitung wiederfinden
+SIDECAR_EXT = {".xmp", ".thm", ".dop", ".pp3"}
 
 MARKS_FILE = ".photoselection.json"                        # pro Quellordner
 SLOTS_FILE = Path.home() / ".photoselection_slots.json"    # global
+LOG_FILE = Path.home() / ".photoselection.log"
 DEV_SUBDIR = "entwickelt"      # Unterordner fuer "zusaetzlich zur RAW-Datei"
 
 CACHE_SIZE = 8                 # schnelle Vorschauen im Speicher
 DEV_CACHE_SIZE = 3             # entwickelte Bilder im Speicher (gross!)
+FULL_CACHE_SIZE = 2            # volle Aufloesung fuer die 100-%-Ansicht
 MAX_DECODE_PX = 3000    # harte Obergrenze der gecachten Vorschau
 DRAFT_PX = 2560         # was von libjpeg angefordert wird, siehe _draft_size()
-ANALYSIS_PX = 900
+ANALYSIS_PX = 1200      # feste Kantenlaenge fuer den Schaerfe-Score
 UNDO_LIMIT = 200
+SORT_MODES = ("Name", "Dateidatum")
 
 SLOT_COLORS = {
     1: "#3ddc84", 2: "#4ea1ff", 3: "#ffb454", 4: "#ff6b8b", 5: "#b48ead",
     6: "#f2e14c", 7: "#4dd0e1", 8: "#e06c75", 9: "#9aa0a6",
 }
+# Fuer Text auf der weissen Liste abgedunkelt - Gelb und Grau waeren sonst kaum lesbar
+LIST_COLORS = {
+    i: "#%02x%02x%02x" % tuple(int(int(c[k:k + 2], 16) * 0.6) for k in (1, 3, 5))
+    for i, c in SLOT_COLORS.items()
+}
 HI_CLIP, LO_CLIP = 250, 6
-LUMA = np.float32([0.299, 0.587, 0.114])
 
 RATIOS = {"frei": None, "3:2": 3 / 2, "2:3": 2 / 3, "4:3": 4 / 3, "3:4": 3 / 4,
           "1:1": 1.0, "16:9": 16 / 9}
 DENOISE = {"aus": 0, "leicht": 1, "stark": 2}   # rawpy.FBDDNoiseReductionMode
 LONG_EDGES = OrderedDict([("Original", 0), ("4096 px", 4096), ("3000 px", 3000),
                           ("2048 px", 2048), ("1600 px", 1600), ("1200 px", 1200)])
+
+# Was beim Export mit "Standort und Seriennummern entfernen" wegfaellt: das
+# GPS-IFD sowie Besitzer, Seriennummern und die MakerNote (in der Hersteller
+# oft weitere Seriennummern ablegen) aus dem Exif-IFD
+PRIVATE_EXIF_TAGS = (0xA430, 0xA431, 0xA435, 0x927C)
+_MOUNT_POINT = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+
+# --------------------------------------------------------------------------
+# Dateien
+# --------------------------------------------------------------------------
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Erst vollstaendig daneben schreiben, dann austauschen.
+
+    Ein Abbruch mittendrin (Absturz, Karte gezogen, Netzwerk weg) hinterlaesst
+    so immer die alte oder die neue Fassung - nie eine halbe, die beim
+    naechsten Laden verworfen wuerde.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _publish(part: Path, dest: Path) -> None:
+    """Fertig geschriebene Datei an ihren Platz bringen - ohne zu ueberschreiben."""
+    try:
+        if dest.exists():   # unter Windows verweigert rename das ohnehin
+            raise FileExistsError(f"existiert bereits: {dest}")
+        os.rename(part, dest)
+    except BaseException:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _signature(path: Path) -> tuple[int, int, int]:
+    """Woran sich eine Datei wiedererkennen laesst - die Groesse allein reicht nicht."""
+    st = path.stat()
+    return st.st_size, st.st_mtime_ns, st.st_ino
+
+
+def _same_content(a: Path, b: Path, chunk: int = 1 << 20) -> bool:
+    """Gleicher Inhalt? Unkomprimierte RAWs einer Kamera sind alle gleich gross."""
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                block_a, block_b = fa.read(chunk), fb.read(chunk)
+                if block_a != block_b:
+                    return False
+                if not block_a:
+                    return True
+    except OSError:
+        return False
+
+
+def _numbered(name: str, stem: str, n: int) -> str:
+    """IMG_1.CR2 -> IMG_1_2.CR2, auch fuer Begleitdateien wie IMG_1.CR2.xmp."""
+    if name.lower().startswith(stem.lower()):
+        return f"{name[:len(stem)]}_{n}{name[len(stem):]}"
+    path = Path(name)
+    return f"{path.stem}_{n}{path.suffix}"
+
+
+def _free_path(dest: Path) -> Path:
+    """dest selbst, wenn frei - sonst dest_1, dest_2 ..."""
+    n = 0
+    candidate = dest
+    while candidate.exists():
+        n += 1
+        candidate = dest.with_name(f"{dest.stem}_{n}{dest.suffix}")
+    return candidate
+
+
+def _is_link(entry: os.DirEntry) -> bool:
+    """Symlink oder Windows-Junction - beides fuehrt womoeglich aus dem Ordner heraus."""
+    if entry.is_symlink():
+        return True
+    try:
+        return entry.stat(follow_symlinks=False).st_reparse_tag == _MOUNT_POINT
+    except (AttributeError, OSError):   # st_reparse_tag gibt es nur unter Windows
+        return False
+
+
+def _natural_key(text: str) -> list:
+    """IMG_2 vor IMG_10, unabhaengig von Gross- und Kleinschreibung."""
+    return [int(t) if t.isdigit() else t.casefold() for t in re.split(r"(\d+)", text)]
 
 
 # --------------------------------------------------------------------------
@@ -96,7 +247,7 @@ def _clean_slot(value) -> int:
     """Zuordnung aus einer Datei - nur 1 bis 9 sind gueltig, sonst 0."""
     try:
         slot = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: Infinity
         return 0
     return slot if 1 <= slot <= 9 else 0
 
@@ -141,13 +292,16 @@ class Develop:
     ratio: str = "frei"
     crop: tuple | None = None    # (x0, y0, x1, y1), relativ zum geraden Bild
 
-    def base_key(self) -> tuple:
-        """Parameter, die eine erneute RAW-Entwicklung erfordern.
+    def base_key(self, raw: bool = True) -> tuple:
+        """Parameter, die eine erneute Entwicklung des Basisbilds erfordern.
 
         Bei eingeschalteter Auto-Helligkeit wird die Belichtung erst nach der
         Entwicklung angewendet - sie taucht deshalb hier nicht auf und der
-        Regler wirkt ohne Wartezeit.
+        Regler wirkt ohne Wartezeit. Bei JPG & Co. steckt nur der Weissabgleich
+        im Basisbild, die Belichtung kommt immer danach (pending_exposure).
         """
+        if not raw:
+            return (self.wb, self.kelvin, self.tint)
         return (0.0 if self.auto_bright else round(self.exposure, 2),
                 self.wb, self.kelvin, self.tint, self.auto_bright, self.denoise)
 
@@ -156,6 +310,17 @@ class Develop:
 
     def copy(self) -> "Develop":
         return Develop(**asdict(self))
+
+    def transferred_to(self, target: "Develop") -> "Develop":
+        """Diese Einstellungen fuer eine andere Aufnahme.
+
+        Zuschnitt, Seitenverhaeltnis, Drehung und Geraderichten gehoeren zum
+        Motiv - sie bleiben, wie sie bei der Zielaufnahme waren.
+        """
+        new = self.copy()
+        for name in GEOMETRY_FIELDS:
+            setattr(new, name, getattr(target, name))
+        return new
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -198,9 +363,12 @@ class Develop:
                         continue
                     number = min(max(number, lo), hi)
                     setattr(dev, name, number if isinstance(lo, float) else int(number))
-            except (TypeError, ValueError, KeyError):
+            except (TypeError, ValueError, KeyError, OverflowError):
                 continue   # Standardwert behalten
         return dev
+
+
+GEOMETRY_FIELDS = ("crop", "ratio", "orient", "angle")
 
 
 @dataclass
@@ -210,7 +378,7 @@ class Preview:
     image: Image.Image | None = None
     exif: dict = field(default_factory=dict)
     sharpness: float = 0.0
-    hist: np.ndarray | None = None
+    full_size: tuple[int, int] | None = None   # Pixelmasse des Originals, fuer 100 %
     error: str = ""
 
 
@@ -221,14 +389,15 @@ class Preview:
 def load_preview(path: Path) -> Preview:
     try:
         if path.suffix.lower() in RAW_EXT and rawpy is not None:
-            img, thumb_exif = _load_raw_thumb(path)
+            img, thumb_exif, full = _load_raw_thumb(path)
         else:
             img = Image.open(path)
+            full = img.size
             target = _draft_size(img.size, DRAFT_PX)
             if target:
                 img.draft("RGB", target)
             img.load()
-            img = ImageOps.exif_transpose(img)
+            img = _to_srgb(ImageOps.exif_transpose(img))
             thumb_exif = _exif_from_pil(img)
 
         if img.mode != "RGB":
@@ -236,40 +405,97 @@ def load_preview(path: Path) -> Preview:
         if max(img.size) > MAX_DECODE_PX:
             img.thumbnail((MAX_DECODE_PX, MAX_DECODE_PX), Image.Resampling.LANCZOS)
 
-        sharp, hist = analyse(img)
         return Preview(image=img, exif=read_exif(path) or thumb_exif,
-                       sharpness=sharp, hist=hist)
+                       sharpness=analyse(img), full_size=_oriented(full, img.size))
     except Exception as exc:
         return Preview(error=f"{type(exc).__name__}: {exc}")
 
 
-def _load_raw_thumb(path: Path) -> tuple[Image.Image, dict]:
+def load_full(path: Path) -> Image.Image:
+    """Volle Aufloesung fuer die 100-%-Ansicht - im Hintergrund, kann dauern."""
+    if is_raw(path):
+        with rawpy.imread(str(path)) as raw:
+            flip = getattr(raw.sizes, "flip", 0)
+            sensor = max(raw.sizes.width, raw.sizes.height)
+            try:
+                thumb = raw.extract_thumb()
+            except Exception:
+                thumb = None
+            if thumb is not None and thumb.format == rawpy.ThumbFormat.JPEG:
+                img = Image.open(io.BytesIO(thumb.data))
+                if max(img.size) >= 0.9 * sensor:   # Vorschaubild in voller Groesse
+                    return _open_thumb(img, flip, draft=False)[0].convert("RGB")
+            # Sonst bleibt nur die volle Entwicklung mit Kamera-Weissabgleich
+            return Image.fromarray(raw.postprocess(use_camera_wb=True, output_bps=8))
+    img = Image.open(path)
+    img.load()
+    return _to_srgb(ImageOps.exif_transpose(img))
+
+
+def _load_raw_thumb(path: Path) -> tuple[Image.Image, dict, tuple[int, int] | None]:
     with rawpy.imread(str(path)) as raw:
         flip = getattr(raw.sizes, "flip", 0)
+        full = (raw.sizes.width, raw.sizes.height)
         try:
             thumb = raw.extract_thumb()
         except Exception:
             thumb = None
 
         if thumb is not None and thumb.format == rawpy.ThumbFormat.JPEG:
-            img = Image.open(io.BytesIO(thumb.data))
-            # Viele Kameras legen ein Vorschaubild in voller Groesse ab - draft()
-            # laesst libjpeg direkt verkleinert dekodieren, das spart ein Vielfaches
-            target = _draft_size(img.size, DRAFT_PX)
-            if target:
-                img.draft("RGB", target)
-            img.load()
-            exif = _exif_from_pil(img)
-            had_orientation = bool(img.getexif().get(0x0112))
-            img = ImageOps.exif_transpose(img)
-            if not had_orientation:
-                img = _apply_flip(img, flip)
-            return img, exif
+            img, exif = _open_thumb(Image.open(io.BytesIO(thumb.data)), flip, draft=True)
+            return img, exif, full
 
         if thumb is not None and thumb.format == rawpy.ThumbFormat.BITMAP:
-            return _apply_flip(Image.fromarray(thumb.data), flip), {}
+            return _apply_flip(Image.fromarray(thumb.data), flip), {}, full
 
-        return Image.fromarray(raw.postprocess(half_size=True, use_camera_wb=True)), {}
+        img = Image.fromarray(raw.postprocess(half_size=True, use_camera_wb=True))
+        return img, {}, full
+
+
+def _open_thumb(img: Image.Image, flip: int, draft: bool) -> tuple[Image.Image, dict]:
+    """Eingebettetes Vorschau-JPEG dekodieren und richtig herum drehen."""
+    if draft:
+        # Viele Kameras legen ein Vorschaubild in voller Groesse ab - draft()
+        # laesst libjpeg direkt verkleinert dekodieren, das spart ein Vielfaches
+        target = _draft_size(img.size, DRAFT_PX)
+        if target:
+            img.draft("RGB", target)
+    img.load()
+    exif = _exif_from_pil(img)
+    had_orientation = bool(img.getexif().get(0x0112))
+    img = ImageOps.exif_transpose(img)
+    if not had_orientation:
+        img = _apply_flip(img, flip)
+    return img, exif
+
+
+def _oriented(full: tuple[int, int] | None, shown: tuple[int, int]):
+    """Originalmasse in der Ausrichtung des angezeigten Bildes."""
+    if not full or not all(full):
+        return None
+    if (full[0] >= full[1]) != (shown[0] >= shown[1]):
+        return full[1], full[0]
+    return tuple(full)
+
+
+_SRGB = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")) if ImageCms else None
+
+
+def _to_srgb(img: Image.Image) -> Image.Image:
+    """Eingebettetes Farbprofil (z. B. Adobe RGB) nach sRGB umrechnen.
+
+    Ohne das wirken solche Bilder in der Vorschau flau, und ein Export ohne
+    Profil zeigt sie anderswo mit falschen Farben.
+    """
+    icc = img.info.get("icc_profile")
+    if icc and _SRGB is not None:
+        try:
+            profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+            if "srgb" not in ImageCms.getProfileDescription(profile).lower():
+                return ImageCms.profileToProfile(img, profile, _SRGB, outputMode="RGB")
+        except Exception:
+            pass   # defektes Profil - dann eben ohne Umrechnung
+    return img if img.mode == "RGB" else img.convert("RGB")
 
 
 def _apply_flip(img: Image.Image, flip: int) -> Image.Image:
@@ -297,22 +523,27 @@ def _draft_size(size: tuple[int, int], limit: int) -> tuple[int, int] | None:
     return max(1, int(size[0] * scale)), max(1, int(size[1] * scale))
 
 
-def analyse(img: Image.Image) -> tuple[float, np.ndarray]:
-    """Schaerfe-Score (Laplace-Varianz der Bildmitte) und RGB-Histogramm."""
-    factor = max(1, int(max(img.size) / ANALYSIS_PX))
-    small = img.reduce(factor) if factor > 1 else img   # schnelle Kastenfilterung
-    # PIL zaehlt das Histogramm in C - deutlich schneller als numpy je Kanal
-    hist = np.asarray(small.histogram()[:768], dtype=np.int64).reshape(3, 256)
+def analyse(img: Image.Image) -> float:
+    """Schaerfe-Score: Laplace-Varianz der Bildmitte.
 
-    grey = np.asarray(small, dtype=np.float32) @ LUMA
+    Gemessen wird immer bei derselben Kantenlaenge - die Laplace-Varianz
+    haengt stark vom Massstab ab, und die Vorschaubilder sind je nach Kamera
+    und Format unterschiedlich gross.
+    """
+    small = img
+    if max(img.size) > ANALYSIS_PX:
+        scale = ANALYSIS_PX / max(img.size)
+        small = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                           Image.Resampling.BOX)
+    grey = np.asarray(small.convert("L"), dtype=np.float32)
     h, w = grey.shape
     # Nur die mittleren 60 % bewerten - Bokeh am Rand ist ja gewollt
     grey = grey[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)]
     if grey.size < 64:
-        return 0.0, hist
+        return 0.0
     lap = (4 * grey[1:-1, 1:-1] - grey[:-2, 1:-1] - grey[2:, 1:-1]
            - grey[1:-1, :-2] - grey[1:-1, 2:])
-    return float(lap.var()), hist
+    return float(lap.var())
 
 
 # --------------------------------------------------------------------------
@@ -357,31 +588,48 @@ def pending_exposure(path: Path, dev: Develop) -> float:
     -1 EV bei den meisten Dateien exakt deckungsgleich mit 0 EV. Bei
     eingeschalteter Auto-Helligkeit wird die Belichtung deshalb erst danach
     angewendet; ausgeschaltet greift sie linear im RAW (bessere Lichter).
+    JPG & Co. haben kein RAW - dort kommt die Belichtung immer danach.
     """
-    return dev.exposure if (is_raw(path) and dev.auto_bright) else 0.0
+    if not is_raw(path):
+        return dev.exposure
+    return dev.exposure if dev.auto_bright else 0.0
 
 
 def develop_base(path: Path, dev: Develop, half: bool = True) -> Image.Image:
-    """Basis-Bild: RAW entwickeln bzw. JPG laden, inklusive Weissabgleich."""
+    """Basis-Bild: RAW entwickeln bzw. JPG laden, inklusive Weissabgleich.
+
+    half: fuer die Vorschau genuegt das RAW in halber Aufloesung bzw. ein JPG
+    in Vorschaugroesse - ein 40-MP-JPG voll zu laden kostet sonst mit den
+    Rechenkopien ueber ein Gigabyte.
+    """
     if is_raw(path):
         return _develop_raw(path, dev, half)
 
     img = Image.open(path)
+    if half:
+        target = _draft_size(img.size, DRAFT_PX)
+        if target:
+            img.draft("RGB", target)
     img.load()
-    img = ImageOps.exif_transpose(img).convert("RGB")
+    img = _to_srgb(ImageOps.exif_transpose(img))
+    if half and max(img.size) > MAX_DECODE_PX:
+        img.thumbnail((MAX_DECODE_PX, MAX_DECODE_PX), Image.Resampling.LANCZOS)
     gains = _kelvin_gains(dev.kelvin, dev.tint) if dev.wb == "Kelvin" else None
     if dev.wb == "Auto":
-        arr = np.asarray(img, np.float32)
-        mean = arr.reshape(-1, 3).mean(axis=0)
+        mean = np.float32(ImageStat.Stat(img).mean[:3])
         gains = np.float32(mean.mean() / np.maximum(mean, 1e-3))
-    if dev.exposure or gains is not None:
-        img = _apply_gains(img, gains, dev.exposure)
+    if gains is not None:
+        img = _apply_gains(img, gains, 0.0)
     return img
 
 
 def _raw_wb_reference(raw) -> np.ndarray | None:
-    """Weissabgleich der Kamera als R,G,B - None, wenn unbrauchbar."""
-    for attr in ("camera_whitebalance", "daylight_whitebalance"):
+    """Bezugs-Weissabgleich als R,G,B - None, wenn unbrauchbar.
+
+    Tageslicht zuerst: dann bedeutet 5500 K auch Tageslicht und nicht
+    "wie die Kamera es eingestellt hatte".
+    """
+    for attr in ("daylight_whitebalance", "camera_whitebalance"):
         values = list(getattr(raw, attr, []) or [])[:3]
         if len(values) == 3 and min(values) > 0:
             values = np.float32(values)
@@ -432,16 +680,21 @@ def _develop_raw(path: Path, dev: Develop, half: bool) -> Image.Image:
     return _apply_gains(img, post_gains, 0.0) if post_gains is not None else img
 
 
+_LEVELS = np.arange(256, dtype=np.float64) / 255.0
+
+
 def _apply_gains(img: Image.Image, gains, exposure: float) -> Image.Image:
-    """Belichtung und Farbfaktoren in linearem Licht anwenden."""
-    arr = np.asarray(img, np.float32) / 255.0
-    lin = np.power(arr, 2.2)
-    if exposure:
-        lin *= 2.0 ** exposure
-    if gains is not None:
-        lin *= np.asarray(gains, np.float32)
-    return Image.fromarray(
-        (np.power(np.clip(lin, 0.0, 1.0), 1 / 2.2) * 255 + 0.5).astype(np.uint8))
+    """Belichtung und Farbfaktoren in linearem Licht anwenden.
+
+    Jeder Kanal haengt nur von sich selbst ab - eine Tabelle mit 3 x 256
+    Eintraegen ist deshalb exakt und um ein Vielfaches schneller als die
+    Rechnung je Pixel.
+    """
+    factors = np.ones(3) if gains is None else np.asarray(gains, np.float64)
+    factors = factors * 2.0 ** exposure
+    lin = np.power(_LEVELS, 2.2)
+    lut = np.concatenate([np.power(np.clip(lin * f, 0.0, 1.0), 1 / 2.2) for f in factors])
+    return img.point((lut * 255 + 0.5).astype(np.uint8).tolist())
 
 
 def _inscribed(w: float, h: float, angle: float) -> tuple[float, float]:
@@ -471,10 +724,10 @@ def straighten(img: Image.Image, dev: Develop) -> Image.Image:
     return img
 
 
-def apply_geometry(img: Image.Image, dev: Develop) -> Image.Image:
-    img = straighten(img, dev)
-    if dev.crop:
-        x0, y0, x1, y1 = dev.crop
+def crop_to(img: Image.Image, crop: tuple | None) -> Image.Image:
+    """Zuschnitt des Nutzers, relativ zum geraden Bild."""
+    if crop:
+        x0, y0, x1, y1 = crop
         box = (round(x0 * img.width), round(y0 * img.height),
                round(x1 * img.width), round(y1 * img.height))
         if box[2] - box[0] >= 16 and box[3] - box[1] >= 16:
@@ -482,26 +735,33 @@ def apply_geometry(img: Image.Image, dev: Develop) -> Image.Image:
     return img
 
 
+def apply_geometry(img: Image.Image, dev: Develop) -> Image.Image:
+    return crop_to(straighten(img, dev), dev.crop)
+
+
 def apply_rgb(img: Image.Image, dev: Develop, extra_ev: float = 0.0) -> Image.Image:
-    """Belichtungsrest, Tonwerte, Kontrast, Saettigung, Schaerfen."""
+    """Belichtungsrest, Tonwerte, Kontrast, Saettigung, Schaerfen.
+
+    Was nur vom Tonwert abhaengt, laeuft ueber Tabellen bzw. in C - die
+    Vorschau rechnet das bei jedem Neuzeichnen.
+    """
     if extra_ev:
         img = _apply_gains(img, None, extra_ev)
-    if any((dev.highlights, dev.shadows, dev.contrast, dev.saturation)):
-        arr = np.asarray(img, np.float32) / 255.0
-        if dev.highlights or dev.shadows:
-            lum = arr @ LUMA
-            gain = np.ones_like(lum)
-            if dev.shadows:
-                gain += (dev.shadows / 100.0) * 0.9 * (1.0 - lum) ** 2
-            if dev.highlights:
-                gain += (dev.highlights / 100.0) * 0.9 * lum ** 2
-            arr = np.clip(arr * gain[..., None], 0.0, 1.0)
-        if dev.contrast:
-            arr = np.clip((arr - 0.5) * (1 + dev.contrast / 100.0) + 0.5, 0.0, 1.0)
-        if dev.saturation:
-            lum = (arr @ LUMA)[..., None]
-            arr = np.clip(lum + (arr - lum) * (1 + dev.saturation / 100.0), 0.0, 1.0)
-        img = Image.fromarray((arr * 255 + 0.5).astype(np.uint8))
+    if dev.highlights or dev.shadows:
+        # Die Verstaerkung haengt nur von der Helligkeit ab: Tabelle ueber L
+        gain_lut = np.ones(256, np.float32)
+        if dev.shadows:
+            gain_lut += np.float32((dev.shadows / 100.0) * 0.9 * (1.0 - _LEVELS) ** 2)
+        if dev.highlights:
+            gain_lut += np.float32((dev.highlights / 100.0) * 0.9 * _LEVELS ** 2)
+        gain = gain_lut[np.asarray(img.convert("L"))]
+        arr = np.asarray(img, np.float32) * gain[..., None]
+        img = Image.fromarray(np.clip(arr + 0.5, 0, 255).astype(np.uint8))
+    if dev.contrast:
+        curve = np.clip((_LEVELS - 0.5) * (1 + dev.contrast / 100.0) + 0.5, 0.0, 1.0)
+        img = img.point((curve * 255 + 0.5).astype(np.uint8).tolist() * 3)
+    if dev.saturation:
+        img = ImageEnhance.Color(img).enhance(1 + dev.saturation / 100.0)
     if dev.sharpen:
         img = img.filter(ImageFilter.UnsharpMask(radius=1.2,
                                                  percent=int(dev.sharpen * 2),
@@ -510,26 +770,46 @@ def apply_rgb(img: Image.Image, dev: Develop, extra_ev: float = 0.0) -> Image.Im
 
 
 def export_jpeg(path: Path, dev: Develop, dest: Path, quality: int,
-                long_edge: int, strip_gps: bool = True) -> None:
-    """Volle Entwicklung in eine JPG-Datei schreiben."""
+                long_edge: int, strip_private: bool = True) -> None:
+    """Volle Entwicklung in eine JPG-Datei schreiben.
+
+    Geschrieben wird erst in eine .part-Datei: ein Abbruch hinterlaesst so
+    keine halbe JPG unter dem richtigen Namen.
+    """
     img = apply_geometry(develop_base(path, dev, half=False), dev)
     if long_edge and max(img.size) > long_edge:
         img.thumbnail((long_edge, long_edge), Image.Resampling.LANCZOS)
     img = apply_rgb(img, dev, pending_exposure(path, dev))
     kwargs = dict(quality=quality, optimize=True,
                   subsampling=0 if quality >= 90 else 2)
-    exif = _exif_bytes(path, strip_gps)
+    exif = _exif_bytes(path, img.size, strip_private)
     if exif:
         kwargs["exif"] = exif
-    img.save(dest, "JPEG", **kwargs)
+    part = dest.with_name(f".{dest.name}.part")
+    try:
+        try:
+            img.save(part, "JPEG", **kwargs)
+        except OSError:
+            # Bei stark verrauschten Bildern reicht Pillows Pufferschaetzung
+            # fuer optimize=True nicht ("Suspension not allowed here") - dann
+            # eben ohne Optimierung, die Datei wird nur etwas groesser
+            img.save(part, "JPEG", **{**kwargs, "optimize": False})
+    except BaseException:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        raise
+    _publish(part, dest)
 
 
-def _exif_bytes(path: Path, strip_gps: bool = True) -> bytes | None:
-    """EXIF fuer die Ausgabedatei - mit neutraler Orientierung.
+def _exif_bytes(path: Path, size: tuple[int, int] | None = None,
+                strip_private: bool = True) -> bytes | None:
+    """EXIF fuer die Ausgabedatei - mit neutraler Orientierung und richtigen Massen.
 
-    Die Aufnahmedaten sollen erhalten bleiben, der Aufnahmeort aber nur, wenn
-    er ausdruecklich gewuenscht ist: exportierte JPGs sind das, was man
-    weitergibt, und GPS-Koordinaten wandern sonst unbemerkt mit.
+    Die Aufnahmedaten sollen erhalten bleiben, Aufnahmeort und Seriennummern
+    aber nur, wenn das ausdruecklich gewuenscht ist: exportierte JPGs sind
+    das, was man weitergibt, und beides wandert sonst unbemerkt mit.
     """
     try:
         if path.suffix.lower() in RAW_EXT:
@@ -546,11 +826,17 @@ def _exif_bytes(path: Path, strip_gps: bool = True) -> bytes | None:
         if not exif:
             return None
         exif[0x0112] = 1          # wir haben schon gedreht
-        for tag in (0x0100, 0x0101, 0xA002, 0xA003):   # alte Bildmasse entfernen
+        for tag in (0x0100, 0x0101):   # Masse des Vorschaubilds
             exif.pop(tag, None)
-        if strip_gps:
+        # Die Pixelmasse stehen im Exif-IFD, nicht im Basis-IFD
+        sub = exif.get_ifd(0x8769)
+        if size and 0x8769 in exif:
+            sub[0xA002], sub[0xA003] = size
+        if strip_private:
             exif.pop(0x8825, None)
             exif.get_ifd(0x8825).clear()
+            for tag in PRIVATE_EXIF_TAGS:
+                sub.pop(tag, None)
         return exif.tobytes()
     except Exception:
         return None
@@ -645,9 +931,13 @@ def _fmt_shutter(value) -> str:
             secs = float(value)
     except Exception:
         return ""
-    if not secs:
+    if not secs or secs < 0:
         return ""
-    return f"1/{round(1 / secs)} s" if secs < 1 else f"{secs:g} s"
+    inverse = 1 / secs
+    # Kurze Zeiten als Bruch; 0,4 oder 0,8 s aber nicht als "1/2" bzw. "1/1"
+    if secs < 0.3 or (secs < 1 and abs(inverse - round(inverse)) < 0.01):
+        return f"1/{round(inverse)} s"
+    return f"{round(secs, 1):g} s"
 
 
 def _fmt_focal(value) -> str:
@@ -662,83 +952,67 @@ def _fmt_focal(value) -> str:
 # Hintergrund-Threads
 # --------------------------------------------------------------------------
 
-class Loader(threading.Thread):
-    """Schnelle Vorschauen."""
+class Failed:
+    """Ergebnis einer Hintergrund-Arbeit, die nicht geklappt hat.
 
-    def __init__(self) -> None:
+    Wird wie ein Ergebnis zwischengespeichert - sonst wuerde dieselbe defekte
+    Datei nach jedem Fehlschlag sofort wieder angefordert.
+    """
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+
+class CacheWorker(threading.Thread):
+    """Hintergrund-Thread mit kleinem Ergebnis-Speicher.
+
+    Angefordert wird immer der komplette aktuelle Bedarf (z. B. das Bild und
+    seine Nachbarn). Was danach nicht mehr gebraucht wird, verwirft der Thread
+    ungelesen - beim schnellen Durchblaettern stauen sich sonst hunderte
+    veraltete Auftraege, die minutenlang abgearbeitet werden und das aktuelle
+    Bild aus dem Speicher verdraengen.
+    """
+
+    def __init__(self, func, size: int) -> None:
         super().__init__(daemon=True)
+        self.func = func
+        self.size = size
         self.requests: queue.LifoQueue = queue.LifoQueue()
         self.done: queue.Queue = queue.Queue()
-        self.cache: OrderedDict[Path, Preview] = OrderedDict()
+        self.cache: OrderedDict = OrderedDict()
         self.lock = threading.Lock()
+        self.wanted: set = set()
 
-    def get(self, path: Path) -> Preview | None:
+    def get(self, key):
+        """Ergebnis, Failed - oder None, solange es noch nicht da ist."""
         with self.lock:
-            prev = self.cache.get(path)
-            if prev is not None:
-                self.cache.move_to_end(path)
-            return prev
-
-    def request(self, paths: list[Path]) -> None:
-        for path in reversed(paths):  # LIFO -> das erste Element zuletzt einreihen
-            if self.get(path) is None:
-                self.requests.put(path)
-
-    def run(self) -> None:
-        while True:
-            path = self.requests.get()
-            if self.get(path) is not None:
-                continue
-            prev = load_preview(path)
-            with self.lock:
-                self.cache[path] = prev
-                while len(self.cache) > CACHE_SIZE:
-                    self.cache.popitem(last=False)
-            self.done.put(path)
-
-
-class Developer(threading.Thread):
-    """Echte RAW-Entwicklung fuer den Bearbeitungsmodus - langsam, daher extra."""
-
-    def __init__(self) -> None:
-        super().__init__(daemon=True)
-        self.requests: queue.LifoQueue = queue.LifoQueue()
-        self.done: queue.Queue = queue.Queue()
-        self.cache: OrderedDict[tuple, Image.Image] = OrderedDict()
-        self.lock = threading.Lock()
-        self.wanted: tuple | None = None
-
-    def get(self, key: tuple) -> Image.Image | None:
-        with self.lock:
-            img = self.cache.get(key)
-            if img is not None:
+            result = self.cache.get(key)
+            if result is not None:
                 self.cache.move_to_end(key)
-            return img
+            return result
 
-    def request(self, path: Path, dev: Develop) -> tuple:
-        key = (str(path),) + dev.base_key()
+    def request(self, jobs: list[tuple]) -> None:
+        """jobs: (Schluessel, *Argumente), das Wichtigste zuerst."""
         with self.lock:
-            self.wanted = key
-        if self.get(key) is None:
-            self.requests.put((key, path, dev.copy()))
-        return key
+            self.wanted = {job[0] for job in jobs}
+        for job in reversed(jobs):  # LIFO -> das erste Element zuletzt einreihen
+            if self.get(job[0]) is None:
+                self.requests.put(job)
 
     def run(self) -> None:
         while True:
-            key, path, dev = self.requests.get()
+            key, *args = self.requests.get()
             with self.lock:
-                stale = self.wanted != key
-            if stale or self.get(key) is not None:
-                continue   # Regler wurde inzwischen weitergezogen
+                if key not in self.wanted or key in self.cache:
+                    continue
             try:
-                img = develop_base(path, dev, half=True)
-            except Exception:
-                img = None
-            if img is not None:
-                with self.lock:
-                    self.cache[key] = img
-                    while len(self.cache) > DEV_CACHE_SIZE:
-                        self.cache.popitem(last=False)
+                result = self.func(*args)
+            except Exception as exc:
+                result = Failed(f"{type(exc).__name__}: {exc}")
+            with self.lock:
+                self.cache[key] = result
+                while len(self.cache) > self.size:
+                    self.cache.popitem(last=False)
             self.done.put(key)
 
 
@@ -754,6 +1028,7 @@ class Entry:
     reldir: str
     files: list[Path] = field(default_factory=list)
     slot: int = 0
+    sidecars: list[Path] = field(default_factory=list)   # XMP & Co., wandern mit
 
     @property
     def preview(self) -> Path:
@@ -774,7 +1049,8 @@ class Entry:
     @property
     def label(self) -> str:
         exts = "+".join(f.suffix.lstrip(".").upper() for f in self.files)
-        return f"{self.stem}  [{exts}]"
+        extra = sorted({f.suffix.lstrip(".").upper() for f in self.sidecars})
+        return f"{self.stem}  [{exts}]" + (f" +{'+'.join(extra)}" if extra else "")
 
 
 @dataclass
@@ -787,6 +1063,25 @@ class Slot:
         return self.name or (self.path.name if self.path else "")
 
 
+@dataclass
+class Job:
+    """Eine Aufnahme beim Ausfuehren - als Momentaufnahme.
+
+    Der Arbeits-Thread darf nichts Lebendes anfassen: waehrend er laeuft,
+    kann in der Oberflaeche weiter zugeordnet und umgestellt werden.
+    """
+
+    key: str             # str(entry.preview), zum Wiederfinden
+    slot: int
+    stem: str
+    reldir: str
+    target: Path
+    master: Path
+    files: list[Path]    # zu kopieren/verschieben - leer bei "statt der RAW-Datei"
+    dev: Develop
+    develop: bool
+
+
 # --------------------------------------------------------------------------
 # Anwendung
 # --------------------------------------------------------------------------
@@ -795,8 +1090,10 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("PhotoSelection")
-        self.geometry("1500x900")
-        self.minsize(980, 600)
+        # Pixelangaben unten sind fuer 96 dpi gedacht - bei 125/150 % mitwachsen
+        self.ui_scale = max(1.0, self.winfo_fpixels("1i") / 96.0)
+        self.geometry(f"{self.px(1500)}x{self.px(900)}")
+        self.minsize(self.px(980), self.px(600))
 
         self.source: Path | None = None
         self.slots: dict[int, Slot] = {i: Slot() for i in range(1, 10)}
@@ -806,27 +1103,44 @@ class App(tk.Tk):
         self.undo_stack: list[dict] = []
         self.develop: dict[str, Develop] = {}      # Schluessel: Pfad der Master-Datei
         self._dev_clipboard: Develop | None = None
+        # Eintraege der Zuordnungsdatei zu Dateien, die gerade nicht eingelesen
+        # sind (z. B. Unterordner bei ausgeschaltetem "Unterordner") - sie
+        # werden beim Speichern unveraendert mitgeschrieben
+        self._foreign_marks: dict = {"assignments": {}, "develop": {}}
 
-        self.loader = Loader()
+        self.loader = CacheWorker(load_preview, CACHE_SIZE)
         self.loader.start()
-        self.developer = Developer()
+        self.full_loader = CacheWorker(load_full, FULL_CACHE_SIZE)
+        self.full_loader.start()
+        self.developer = CacheWorker(develop_base, DEV_CACHE_SIZE)
         self.developer.start()
         # Tk darf nur aus dem Hauptthread bedient werden - Arbeits-Threads
         # melden sich ueber diese Queue, abgeholt wird in _poll()
         self.worker_q: queue.Queue = queue.Queue()
+        self._cancel = threading.Event()
 
+        # zoom: Bildschirmpixel je Pixel des Originals - 1.0 ist echte 100 %
         self.zoom: float | None = None
         self.center = (0.5, 0.5)
+        self._zoom_info = None        # (Einpassen-Zoom, Breite, Hoehe) in Originalpixeln
         self._drag = None
         self._crop_drag = None
+        self._crop_before = None
         self._photo = None
         self._img_box = None          # (left, top, breite, hoehe) auf der Leinwand
+        self._straight_size = None    # Masse des geraden Bildes, Bezug fuer den Zuschnitt
+        self._geo_cache = None
         self._resize_job = None
         self._render_job = None
+        self._drag_job = None
+        self._save_job = None
         self._poll_job = None
         self._dev_pending = None
         self._busy = False
-        self._loading_dev = False
+        self._close_after_run = False
+        self._progress = ""
+        self._save_error = ""
+        self._error_shown = False
         self._suspend_trace = False
 
         self.recursive = tk.BooleanVar(value=False)
@@ -834,9 +1148,11 @@ class App(tk.Tk):
         self.keep_tree = tk.BooleanVar(value=False)
         self.move_files = tk.BooleanVar(value=False)
         self.filter_mode = tk.StringVar(value="Alle")
+        self.sort_mode = tk.StringVar(value=SORT_MODES[0])
         self.show_exif = tk.BooleanVar(value=True)
         self.show_hist = tk.BooleanVar(value=False)
         self.show_clip = tk.BooleanVar(value=False)
+        self.keep_zoom = tk.BooleanVar(value=False)
         self.dev_mode = tk.BooleanVar(value=False)
         self.crop_mode = tk.BooleanVar(value=False)
 
@@ -849,38 +1165,69 @@ class App(tk.Tk):
         self._poll_job = self.after(40, self._poll)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def px(self, value: float) -> int:
+        """Pixelangabe fuer 96 dpi auf die tatsaechliche Bildschirmaufloesung."""
+        return round(value * self.ui_scale)
+
+    def report_callback_exception(self, exc, val, tb) -> None:
+        """Fehler sichtbar machen - unter pythonw gibt es keine Konsole."""
+        text = "".join(traceback.format_exception(exc, val, tb))
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}\n{text}\n")
+        except OSError:
+            pass
+        try:
+            self.status.config(text=f"Fehler: {val}  (Details in {LOG_FILE})")
+        except (AttributeError, tk.TclError):
+            pass
+        if not self._error_shown:   # nur einmal - Folgefehler stehen im Protokoll
+            self._error_shown = True
+            messagebox.showerror("PhotoSelection",
+                                 f"Unerwarteter Fehler:\n{val}\n\nDetails stehen in\n{LOG_FILE}")
+
     # -- Aufbau ------------------------------------------------------------
 
     def _build_ui(self) -> None:
         bar = ttk.Frame(self, padding=(8, 6))
         bar.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(bar, text="Quellordner…", command=self.choose_source).pack(side=tk.LEFT)
-        self.lbl_source = ttk.Label(bar, text="- kein Ordner -", width=40, anchor="w")
+        self.btn_source = ttk.Button(bar, text="Quellordner…", command=self.choose_source)
+        self.btn_source.pack(side=tk.LEFT)
+        self.lbl_source = ttk.Label(bar, text="- kein Ordner -", width=34, anchor="w")
         self.lbl_source.pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Checkbutton(bar, text="Unterordner", variable=self.recursive,
-                        command=self.rescan).pack(side=tk.LEFT)
-        ttk.Checkbutton(bar, text="RAW+JPG als Paar", variable=self.group_pairs,
-                        command=self.rescan).pack(side=tk.LEFT, padx=(10, 12))
+        self.chk_recursive = ttk.Checkbutton(bar, text="Unterordner", variable=self.recursive,
+                                             command=self.rescan)
+        self.chk_recursive.pack(side=tk.LEFT)
+        self.chk_pairs = ttk.Checkbutton(bar, text="RAW+JPG als Paar",
+                                         variable=self.group_pairs, command=self.rescan)
+        self.chk_pairs.pack(side=tk.LEFT, padx=(10, 12))
         ttk.Label(bar, text="Anzeigen:").pack(side=tk.LEFT)
         self.cmb_filter = ttk.Combobox(bar, textvariable=self.filter_mode, width=15,
                                        state="readonly",
                                        values=["Alle", "Nur zugeordnete", "Nur offene"]
                                               + [f"Nur Ordner {i}" for i in range(1, 10)])
         self.cmb_filter.pack(side=tk.LEFT, padx=6)
-        self.cmb_filter.bind("<<ComboboxSelected>>", lambda e: self.refresh_view())
+        self.cmb_filter.bind("<<ComboboxSelected>>", lambda e: self._combo_done(self.refresh_view))
+        ttk.Label(bar, text="Sortierung:").pack(side=tk.LEFT, padx=(6, 0))
+        self.cmb_sort = ttk.Combobox(bar, textvariable=self.sort_mode, width=10,
+                                     state="readonly", values=list(SORT_MODES))
+        self.cmb_sort.pack(side=tk.LEFT, padx=6)
+        self.cmb_sort.bind("<<ComboboxSelected>>", lambda e: self._combo_done(self.resort))
 
         self.btn_run = ttk.Button(bar, text="Zuordnungen ausführen",
                                   command=self.run_assignments)
         self.btn_run.pack(side=tk.RIGHT)
-        ttk.Button(bar, text="Export…", command=self.open_export_dialog).pack(
-            side=tk.RIGHT, padx=6)
+        self.btn_export = ttk.Button(bar, text="Export…", command=self.open_export_dialog)
+        self.btn_export.pack(side=tk.RIGHT, padx=6)
         ttk.Checkbutton(bar, text="Struktur erhalten",
                         variable=self.keep_tree).pack(side=tk.RIGHT, padx=8)
         ttk.Checkbutton(bar, text="Verschieben",
                         variable=self.move_files).pack(side=tk.RIGHT)
 
-        self.pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        self.pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        main = ttk.Frame(self)
+        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.pane = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        self.pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         left = ttk.Frame(self.pane)
         self._build_slot_panel(left)
@@ -894,6 +1241,9 @@ class App(tk.Tk):
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.listbox.bind("<<ListboxSelect>>", self._on_list_select)
+        # Danach gehoeren die Tasten wieder dem Bild - sonst wirkt z. B. die
+        # Leertaste auf den Listeneintrag statt auf das angezeigte Bild
+        self.listbox.bind("<ButtonRelease-1>", lambda e: self.canvas.focus_set())
         self.pane.add(left, weight=0)
 
         centre = ttk.Frame(self.pane)
@@ -906,8 +1256,16 @@ class App(tk.Tk):
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.pane.add(centre, weight=1)
 
-        self.dev_panel = self._build_dev_panel(self.pane)
-        self.after(120, lambda: self.pane.sashpos(0, 380))
+        self.dev_panel = self._build_dev_panel(main)
+
+        # Die Trennlinie erst setzen, wenn die Leiste wirklich Breite hat -
+        # vorher wird sashpos auf 0 begrenzt und die linke Leiste mit den
+        # Zielordnern bleibt zugeklappt
+        def place_sash(event) -> None:
+            if event.width > 2 * self.px(380):
+                self.pane.unbind("<Configure>", self._sash_binding)
+                self.after_idle(lambda: self.pane.sashpos(0, self.px(380)))
+        self._sash_binding = self.pane.bind("<Configure>", place_sash, add="+")
 
         self.status = ttk.Label(self, anchor="w", padding=(8, 4), relief=tk.SUNKEN,
                                 text="Quellordner wählen…")
@@ -916,8 +1274,17 @@ class App(tk.Tk):
                   text="1–9 zuordnen · Leertaste/Enter = Ordner 1 + weiter · "
                        "0/Entf löschen · ←/→ blättern · Strg+Z rückgängig · "
                        "E Bearbeiten · K Zuschnitt · I EXIF · H Histogramm · "
-                       "J Clipping · Z 100 % · R drehen · F Vollbild"
+                       "J Clipping · Z 100 % · L Zoom halten · R drehen · F Vollbild"
                   ).pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _combo_done(self, action) -> None:
+        """Nach der Auswahl die Tasten wieder dem Bild geben.
+
+        Sonst bleibt der Fokus in der Combobox: 1-9 und die Pfeile kommen
+        nicht mehr an, und Pfeil hoch/runter aendern sogar die Auswahl.
+        """
+        self.canvas.focus_set()
+        action()
 
     def _build_slot_panel(self, parent) -> None:
         box = ttk.LabelFrame(parent, text="Zielordner (Tasten 1–9)", padding=(6, 4))
@@ -931,8 +1298,10 @@ class App(tk.Tk):
                                                         pady=1, sticky="w")
             name_var = tk.StringVar(value=self.slots[i].name)
             name_var.trace_add("write", lambda *_, s=i: self._on_slot_rename(s))
-            ttk.Entry(box, textvariable=name_var, width=11).grid(row=i, column=1,
-                                                                 padx=(0, 4), pady=1)
+            name_entry = ttk.Entry(box, textvariable=name_var, width=11)
+            name_entry.grid(row=i, column=1, padx=(0, 4), pady=1)
+            for key in ("<Return>", "<KP_Enter>", "<Escape>"):   # fertig benannt
+                name_entry.bind(key, lambda e: self.canvas.focus_set())
             btn = ttk.Button(box, width=24, command=lambda s=i: self.choose_slot_folder(s))
             btn.grid(row=i, column=2, pady=1, sticky="ew")
             count = ttk.Label(box, text="", width=5, anchor="e")
@@ -970,7 +1339,7 @@ class App(tk.Tk):
         cmb = ttk.Combobox(wb_row, textvariable=self.dev_vars["wb"], width=9,
                            state="readonly", values=["Kamera", "Auto", "Kelvin"])
         cmb.pack(side=tk.LEFT)
-        cmb.bind("<<ComboboxSelected>>", lambda e: self._on_dev_change())
+        cmb.bind("<<ComboboxSelected>>", lambda e: self._combo_done(self._on_dev_change))
         self._slider(frame, "kelvin", "Kelvin", 2000, 12000, "{:.0f} K")
         self._slider(frame, "tint", "Tönung", -100, 100, "{:+.0f}")
         self.dev_vars["auto_bright"] = tk.BooleanVar(value=True)
@@ -983,7 +1352,7 @@ class App(tk.Tk):
         cmb = ttk.Combobox(dn_row, textvariable=self.dev_vars["denoise"], width=9,
                            state="readonly", values=list(DENOISE))
         cmb.pack(side=tk.LEFT)
-        cmb.bind("<<ComboboxSelected>>", lambda e: self._on_dev_change())
+        cmb.bind("<<ComboboxSelected>>", lambda e: self._combo_done(self._on_dev_change))
 
         ttk.Separator(frame).pack(fill=tk.X, pady=8)
         self._slider(frame, "highlights", "Lichter", -100, 100, "{:+.0f}")
@@ -1001,7 +1370,7 @@ class App(tk.Tk):
         cmb = ttk.Combobox(ratio_row, textvariable=self.dev_vars["ratio"], width=9,
                            state="readonly", values=list(RATIOS))
         cmb.pack(side=tk.LEFT)
-        cmb.bind("<<ComboboxSelected>>", lambda e: self._on_ratio_change())
+        cmb.bind("<<ComboboxSelected>>", lambda e: self._combo_done(self._on_ratio_change))
         self._slider(frame, "angle", "Drehung", -45.0, 45.0, "{:+.1f}°")
         crop_row = ttk.Frame(frame)
         crop_row.pack(fill=tk.X, pady=(6, 0))
@@ -1009,7 +1378,7 @@ class App(tk.Tk):
                         command=self.show_current).pack(side=tk.LEFT)
         ttk.Button(crop_row, text="↺", width=3, command=self.reset_crop).pack(side=tk.RIGHT)
 
-        ttk.Label(frame, foreground="#666", wraplength=250, justify="left",
+        ttk.Label(frame, foreground="#666", wraplength=self.px(250), justify="left",
                   text="Die Vorschau entwickelt das RAW in halber Auflösung. "
                        "Ohne Bearbeitungsmodus zeigt sie das Kamera-JPEG, "
                        "Belichtung und Weißabgleich dann nur genähert.\n\n"
@@ -1023,25 +1392,38 @@ class App(tk.Tk):
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=1)
         ttk.Label(row, text=label, width=13).pack(side=tk.LEFT)
-        var = tk.DoubleVar(value=0.0)
+        default = getattr(Develop(), key)
+        var = tk.DoubleVar(value=default)
         self.dev_vars[key] = var
-        value_lbl = ttk.Label(row, text=fmt.format(0), width=9, anchor="e")
+        value_lbl = ttk.Label(row, text=fmt.format(default), width=9, anchor="e")
         value_lbl.pack(side=tk.RIGHT)
         scale = ttk.Scale(row, from_=lo, to=hi, variable=var, orient=tk.HORIZONTAL)
         scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         var.trace_add("write", lambda *_, k=key, l=value_lbl, f=fmt:
                       self._on_slider(k, l, f))
         scale.bind("<Double-Button-1>", lambda e, k=key: self._reset_slider(k))
+        # Sonst verstellen die Pfeiltasten beim Blaettern nebenbei den Regler
+        scale.bind("<ButtonRelease-1>", lambda e: self.canvas.focus_set(), add="+")
 
     def _bind_keys(self) -> None:
         def b(sequence, func):
-            # Solange ein Eingabefeld den Fokus hat, gehoeren die Tasten diesem
             def guarded(event, func=func):
-                if isinstance(self.focus_get(), (ttk.Entry, tk.Entry, ttk.Combobox)):
+                widget = event.widget
+                # Nur im Hauptfenster (nicht etwa im Export-Dialog), und
+                # solange ein Eingabefeld den Fokus hat, gehoeren die Tasten
+                # diesem. Bei der aufgeklappten Combobox-Liste ist widget nur
+                # ein Name - dann ebenfalls nichts tun.
+                if not isinstance(widget, tk.Misc) or widget.winfo_toplevel() is not self:
+                    return None
+                if isinstance(widget, (ttk.Entry, tk.Entry, tk.Spinbox)):
                     return None
                 func()
                 return "break"
             self.bind_all(sequence, guarded)
+
+        def letter(char, func):   # auch bei eingeschalteter Feststelltaste
+            b(f"<KeyPress-{char}>", func)
+            b(f"<KeyPress-{char.upper()}>", func)
 
         b("<Right>", lambda: self.step(1))
         b("<Left>", lambda: self.step(-1))
@@ -1051,27 +1433,37 @@ class App(tk.Tk):
         b("<End>", lambda: self.goto(len(self.view) - 1))
         b("<space>", lambda: self.assign(1, toggle=True, advance=True))
         b("<Return>", lambda: self.assign(1, toggle=True, advance=True))
+        b("<KP_Enter>", lambda: self.assign(1, toggle=True, advance=True))
         for i in range(1, 10):
             b(f"<KeyPress-{i}>", lambda s=i: self.assign(s, toggle=True))
+            b(f"<KeyPress-KP_{i}>", lambda s=i: self.assign(s, toggle=True))
         b("<KeyPress-0>", lambda: self.assign(0))
+        b("<KeyPress-KP_0>", lambda: self.assign(0))
         b("<Delete>", lambda: self.assign(0))
         b("<BackSpace>", lambda: self.assign(0))
         b("<Control-z>", self.undo)
-        b("<KeyPress-e>", self.toggle_develop)
-        b("<KeyPress-k>", self.toggle_crop)
-        b("<KeyPress-i>", lambda: self._toggle_overlay(self.show_exif))
-        b("<KeyPress-h>", lambda: self._toggle_overlay(self.show_hist))
-        b("<KeyPress-j>", lambda: self._toggle_overlay(self.show_clip))
+        b("<Control-Z>", self.undo)
+        letter("e", self.toggle_develop)
+        letter("k", self.toggle_crop)
+        letter("i", lambda: self._toggle_overlay(self.show_exif))
+        letter("h", lambda: self._toggle_overlay(self.show_hist))
+        letter("j", lambda: self._toggle_overlay(self.show_clip))
+        letter("l", self.toggle_keep_zoom)
         b("<KeyPress-r>", lambda: self.rotate(90))
         b("<KeyPress-R>", lambda: self.rotate(-90))
-        b("<KeyPress-z>", lambda: self.set_zoom(None if self.zoom else 1.0))
-        b("<KeyPress-f>", self.toggle_fullscreen)
+        letter("z", lambda: self.set_zoom(None if self.zoom else 1.0))
+        letter("f", self.toggle_fullscreen)
         b("<F11>", self.toggle_fullscreen)
         b("<Escape>", lambda: self.attributes("-fullscreen", False))
 
     def _toggle_overlay(self, var: tk.BooleanVar) -> None:
         var.set(not var.get())
         self.show_current()
+
+    def toggle_keep_zoom(self) -> None:
+        self.keep_zoom.set(not self.keep_zoom.get())
+        self.status.config(text="Zoom bleibt beim Blättern erhalten." if self.keep_zoom.get()
+                           else "Beim Blättern wird wieder eingepasst.")
 
     # -- Zielordner --------------------------------------------------------
 
@@ -1101,7 +1493,7 @@ class App(tk.Tk):
                 self.export_cfg["quality"] = min(max(int(export.get("quality", 92)), 60), 100)
                 edge = int(export.get("long_edge", 0))
                 self.export_cfg["long_edge"] = edge if edge in LONG_EDGES.values() else 0
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
 
     def _save_slots(self) -> None:
@@ -1110,7 +1502,7 @@ class App(tk.Tk):
                           for i, s in self.slots.items()},
                 "export": self.export_cfg}
         try:
-            SLOTS_FILE.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            _write_atomic(SLOTS_FILE, json.dumps(data, indent=1))
         except OSError:
             pass
 
@@ -1145,6 +1537,9 @@ class App(tk.Tk):
             path = self.slots[i].path
             widgets["button"].config(text=self._short(path, 28) if path else "Ordner wählen…")
             widgets["count"].config(text=str(counts[i]) if counts[i] else "")
+        if self._busy:
+            self.btn_run.config(text="Abbrechen")
+            return
         total = sum(counts.values())
         suffix = " + JPG" if self.export_cfg["develop"] else ""
         self.btn_run.config(text=f"Zuordnungen ausführen ({total}){suffix}")
@@ -1152,11 +1547,14 @@ class App(tk.Tk):
     # -- Quellordner und Scan ---------------------------------------------
 
     def choose_source(self) -> None:
+        if self._busy:
+            return
         path = filedialog.askdirectory(title="Quellordner mit Fotos wählen")
         if not path:
             return
+        self._flush_marks()          # gehoert noch zum alten Ordner
         self.source = Path(path)
-        self.lbl_source.config(text=self._short(self.source, 40))
+        self.lbl_source.config(text=self._short(self.source, 34))
         self.undo_stack.clear()
         self.develop.clear()
         self.rescan()
@@ -1167,10 +1565,21 @@ class App(tk.Tk):
         return text if len(text) <= width else "…" + text[-(width - 1):]
 
     def rescan(self) -> None:
-        if not self.source:
+        if not self.source or self._busy:
             return
+        # Noch nicht geschriebene Zuordnungen zuerst sichern - _load_marks
+        # liest gleich aus der Datei
+        self._flush_marks()
+        try:
+            found = self._scan_files(self.source)
+        except OSError as exc:
+            messagebox.showerror("PhotoSelection", f"Ordner nicht lesbar:\n{exc}")
+            found = []
+        images = [f for f in found if f.suffix.lower() not in SIDECAR_EXT]
+        sidecars = [f for f in found if f.suffix.lower() in SIDECAR_EXT]
+
         groups: OrderedDict[tuple, Entry] = OrderedDict()
-        for f in self._scan_files(self.source):
+        for f in images:
             reldir = str(f.parent.relative_to(self.source))
             key = (reldir, f.stem.lower()) if self.group_pairs.get() else (reldir, f.name.lower())
             entry = groups.get(key)
@@ -1180,27 +1589,88 @@ class App(tk.Tk):
 
         for entry in groups.values():
             entry.files.sort(key=lambda p: (p.suffix.lower() not in JPG_EXT, p.name))
+        self._attach_sidecars(list(groups.values()), sidecars)
 
         self.entries = list(groups.values())
+        self._sort_entries()
         self._load_marks()
         self.index = 0
         self.refresh_view()
 
-    def _scan_files(self, root: Path) -> list[Path]:
-        found: list[Path] = []
-        if self.recursive.get():
-            for dirpath, dirnames, filenames in os.walk(root):
-                dirnames.sort()
-                found += [Path(dirpath) / n for n in sorted(filenames)
-                          if Path(n).suffix.lower() in ALL_EXT]
+    def _attach_sidecars(self, entries: list[Entry], sidecars: list[Path]) -> None:
+        """Begleitdateien ihrer Aufnahme zuordnen.
+
+        IMG_1.xmp gehoert zur Aufnahme IMG_1 (bei getrennten RAW und JPG zur
+        RAW-Datei), IMG_1.CR2.xmp genau zur Datei IMG_1.CR2.
+        """
+        by_stem: dict[tuple, list[Entry]] = {}
+        for entry in entries:
+            by_stem.setdefault((entry.reldir, entry.stem.lower()), []).append(entry)
+        for f in sidecars:
+            reldir = str(f.parent.relative_to(self.source))
+            base = f.name[:-len(f.suffix)]
+            inner = Path(base).suffix.lower()
+            stem = Path(base).stem if inner in ALL_EXT else base
+            candidates = by_stem.get((reldir, stem.lower()), [])
+            if not candidates:
+                continue   # verwaiste Begleitdatei - bleibt, wo sie ist
+            exact = [e for e in candidates
+                     if any(p.name.lower() == base.lower() for p in e.files)]
+            with_raw = [e for e in candidates if e.raw is not None]
+            (exact or with_raw or candidates)[0].sidecars.append(f)
+
+    def _sort_entries(self) -> None:
+        if self.sort_mode.get() == "Dateidatum":
+            def mtime(entry: Entry) -> float:
+                try:
+                    return entry.master.stat().st_mtime
+                except OSError:
+                    return 0.0
+            self.entries.sort(key=lambda e: (mtime(e), _natural_key(e.stem)))
         else:
-            found = [p for p in sorted(root.iterdir())
-                     if p.is_file() and p.suffix.lower() in ALL_EXT]
+            self.entries.sort(key=lambda e: (_natural_key(e.reldir), _natural_key(e.stem)))
+
+    def resort(self) -> None:
+        self._sort_entries()
+        self.refresh_view()
+
+    def _scan_files(self, root: Path) -> list[Path]:
+        """Bilder und Begleitdateien einsammeln.
+
+        Verknuepfungen (Symlinks und Windows-Junctions) werden uebersprungen:
+        der Scan soll den Quellordner nicht verlassen, und eine Datei, die nur
+        ueber eine Verknuepfung erreichbar ist, wuerde beim Verschieben von
+        ganz woanders weggeholt. os.walk folgt Junctions, deshalb von Hand.
+        """
+        wanted = ALL_EXT | SIDECAR_EXT
+        found: list[Path] = []
+        pending = [root]
+        while pending:
+            folder = pending.pop()
+            try:
+                with os.scandir(folder) as it:
+                    items = sorted(it, key=lambda e: e.name)
+            except OSError:
+                if folder == root:
+                    raise
+                continue   # unlesbarer Unterordner
+            subdirs = []
+            for item in items:
+                if _is_link(item):
+                    continue
+                if item.is_dir(follow_symlinks=False):
+                    subdirs.append(Path(item.path))
+                elif (item.is_file(follow_symlinks=False)
+                      and Path(item.name).suffix.lower() in wanted):
+                    found.append(Path(item.path))
+            if self.recursive.get():
+                pending.extend(reversed(subdirs))   # Tiefensuche in Namensfolge
         return found
 
     # -- Speichern ---------------------------------------------------------
 
     def _load_marks(self) -> None:
+        self._foreign_marks = {"assignments": {}, "develop": {}}
         path = self.source / MARKS_FILE if self.source else None
         if not path or not path.exists():
             return
@@ -1210,37 +1680,81 @@ class App(tk.Tk):
             return
         # Die Datei reist mit dem Ordner mit und kann beschädigt oder
         # präpariert sein - deshalb wird alles daraus geprüft
+        if not isinstance(data, dict):
+            return
         assignments = data.get("assignments")
         develop = data.get("develop")
         assignments = assignments if isinstance(assignments, dict) else {}
         develop = develop if isinstance(develop, dict) else {}
 
+        known = set()
         for entry in self.entries:
             for f in entry.files:
-                slot = _clean_slot(assignments.get(self._rel(f)))
-                if slot:
+                rel = self._rel(f)
+                known.add(rel)
+                slot = _clean_slot(assignments.get(rel))
+                if slot and not entry.slot:
                     entry.slot = slot
-                    break
             stored = develop.get(self._rel(entry.master))
             if stored:
                 self.develop[str(entry.master)] = Develop.from_dict(stored)
 
+        # Eintraege zu Dateien, die gerade nicht eingelesen sind, aufheben -
+        # aber nur, solange es die Datei noch gibt
+        for name, value in assignments.items():
+            slot = _clean_slot(value)
+            if name not in known and slot and self._exists_in_source(name):
+                self._foreign_marks["assignments"][name] = slot
+        for name, value in develop.items():
+            if name not in known and isinstance(value, dict) and self._exists_in_source(name):
+                self._foreign_marks["develop"][name] = Develop.from_dict(value).to_dict()
+
+    def _exists_in_source(self, name) -> bool:
+        """Liegt diese Datei (Pfad aus der Zuordnungsdatei) im Quellordner?"""
+        if not isinstance(name, str) or ":" in name or "\\" in name:
+            return False
+        rel = PurePosixPath(name)
+        if rel.is_absolute() or ".." in rel.parts:
+            return False
+        return (self.source / rel).is_file()
+
     def _save_marks(self) -> None:
+        """Zuordnungen und Bearbeitung jetzt schreiben (und anstehendes Speichern erledigen)."""
+        if self._save_job:
+            self.after_cancel(self._save_job)
+            self._save_job = None
         if not self.source:
             return
-        assignments = {self._rel(f): e.slot
-                       for e in self.entries if e.slot for f in e.files}
-        develop = {}
+        assignments = dict(self._foreign_marks["assignments"])
+        assignments.update({self._rel(f): e.slot
+                            for e in self.entries if e.slot for f in e.files})
+        develop = dict(self._foreign_marks["develop"])
         for entry in self.entries:
             dev = self.develop.get(str(entry.master))
             if dev is not None and not dev.is_default():
                 develop[self._rel(entry.master)] = dev.to_dict()
         try:
-            (self.source / MARKS_FILE).write_text(
-                json.dumps({"assignments": assignments, "develop": develop}, indent=1),
-                encoding="utf-8")
-        except OSError:
-            pass  # z. B. schreibgeschützte Speicherkarte
+            _write_atomic(self.source / MARKS_FILE,
+                          json.dumps({"assignments": assignments, "develop": develop}, indent=1))
+            self._save_error = ""
+        except OSError as exc:   # z. B. schreibgeschützte Speicherkarte
+            self._save_error = f"Zuordnungen nicht gespeichert: {exc.strerror or exc}"
+
+    def _mark_dirty(self) -> None:
+        """Gleich speichern - gebuendelt, statt bei jedem Tastendruck die Datei zu schreiben."""
+        if self._save_job:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(400, self._save_marks_later)
+
+    def _save_marks_later(self) -> None:
+        self._save_job = None
+        self._save_marks()
+        if self._save_error:
+            self._update_status()
+
+    def _flush_marks(self) -> None:
+        if self._save_job:
+            self._save_marks()
 
     def _rel(self, f: Path) -> str:
         return f.relative_to(self.source).as_posix()
@@ -1264,7 +1778,7 @@ class App(tk.Tk):
         for i, entry in enumerate(self.view):
             self.listbox.insert(tk.END, self._row_text(entry))
             if entry.slot:
-                self.listbox.itemconfig(i, foreground=SLOT_COLORS[entry.slot])
+                self.listbox.itemconfig(i, foreground=LIST_COLORS[entry.slot])
 
         self.index = self.view.index(current) if current in self.view else \
             max(0, min(self.index, len(self.view) - 1))
@@ -1281,8 +1795,9 @@ class App(tk.Tk):
         if not self.view:
             return
         self.index = max(0, min(index, len(self.view) - 1))
-        self.zoom = None
-        self.center = (0.5, 0.5)
+        if not self.keep_zoom.get():   # mit L bleibt der Ausschnitt fuer Serienvergleiche
+            self.zoom = None
+            self.center = (0.5, 0.5)
         self._sync_dev_panel()
         self.show_current()
 
@@ -1298,7 +1813,7 @@ class App(tk.Tk):
         entry = self.view[index]
         self.listbox.delete(index)
         self.listbox.insert(index, self._row_text(entry))
-        self.listbox.itemconfig(index, foreground=SLOT_COLORS.get(entry.slot, "black"))
+        self.listbox.itemconfig(index, foreground=LIST_COLORS.get(entry.slot, "black"))
         self._select_row()
 
     def _select_row(self) -> None:
@@ -1320,10 +1835,15 @@ class App(tk.Tk):
         self._push_undo({"type": "assign", "key": str(entry.preview),
                          "old": entry.slot, "new": new})
         entry.slot = new
-        self._save_marks()
+        self._mark_dirty()
 
         if self.filter_mode.get() != "Alle":
             self.refresh_view()
+            # Fiel das Bild aus der gefilterten Ansicht heraus, steht der
+            # Index schon auf dem naechsten - weiterschalten wuerde eins
+            # ueberspringen
+            if not any(e is entry for e in self.view):
+                advance = False
         else:
             self._update_row(self.index)
             self._refresh_slot_panel()
@@ -1337,11 +1857,19 @@ class App(tk.Tk):
 
     def _push_undo(self, action: dict) -> None:
         self.undo_stack.append(action)
-        del self.undo_stack[:-UNDO_LIMIT]
+        # Abgeschlossene Datei-Vorgaenge zuletzt verdraengen - die lassen sich
+        # anders kaum zuruecknehmen, Zuordnungen und Regler schon
+        while len(self.undo_stack) > UNDO_LIMIT:
+            oldest = next((i for i, a in enumerate(self.undo_stack) if a["type"] != "files"), 0)
+            del self.undo_stack[oldest]
 
     def _entry_by_key(self, key: str) -> Entry | None:
         """Eintraege werden beim Neueinlesen neu erzeugt - ueber den Pfad wiederfinden."""
         return next((e for e in self.entries if str(e.preview) == key), None)
+
+    def _entries_by_key(self) -> dict[str, Entry]:
+        """Wie _entry_by_key, fuer viele auf einmal."""
+        return {str(e.preview): e for e in self.entries}
 
     def undo(self) -> None:
         if self._busy:
@@ -1357,7 +1885,7 @@ class App(tk.Tk):
                 self.status.config(text="Rückgängig nicht möglich - Bild nicht mehr da.")
                 return
             entry.slot = action["old"]
-            self._save_marks()
+            self._mark_dirty()
             self.refresh_view()
             if entry in self.view:
                 self.goto(self.view.index(entry))
@@ -1368,8 +1896,9 @@ class App(tk.Tk):
         if action["type"] in ("develop", "develop_many"):
             items = action.get("items") or [(action["key"], action["old"])]
             restored = 0
+            by_key = self._entries_by_key()
             for key, old in items:
-                entry = self._entry_by_key(key)
+                entry = by_key.get(key)
                 if entry is not None:
                     self.develop[str(entry.master)] = Develop.from_dict(old)
                     restored += 1
@@ -1377,7 +1906,7 @@ class App(tk.Tk):
                 self.status.config(text="Rückgängig nicht möglich - Bild nicht mehr da.")
                 return
             self._dev_pending = None
-            self._save_marks()
+            self._mark_dirty()
             self.refresh_view()
             self.status.config(text=f"Rückgängig: Bearbeitung von {restored} Aufnahme(n)")
             return
@@ -1393,21 +1922,30 @@ class App(tk.Tk):
             self.undo_stack.append(action)
             return
 
-        failed = changed = 0
-        for src, dest, kind, size in ops:
+        failed = changed = blocked = 0
+        for src, dest, kind, signature in ops:
             try:
-                dest = Path(dest)
+                src, dest = Path(src), Path(dest)
                 if not dest.exists():
                     continue
                 # Nur zurücknehmen, was noch unverändert unsere Datei ist -
                 # sonst löschen wir womöglich etwas, das jemand anders dort
-                # inzwischen abgelegt hat
-                if dest.stat().st_size != size:
+                # inzwischen abgelegt hat. Groesse, Zeitstempel und Datei-ID
+                # zusammen; die Groesse allein ist bei RAWs oft gleich.
+                if _signature(dest) != signature:
                     changed += 1
                     continue
                 if kind == "move":
-                    Path(src).parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(dest), str(src))
+                    # Liegt am Ursprungsort inzwischen etwas anderes, bleibt
+                    # unsere Datei im Ziel - shutil.move wuerde es unter
+                    # Windows still ueberschreiben
+                    if src.exists():
+                        blocked += 1
+                        continue
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                    _, problem = self._transfer(dest, src, move=True)
+                    if problem:
+                        failed += 1
                 else:
                     dest.unlink()
             except Exception:
@@ -1421,15 +1959,18 @@ class App(tk.Tk):
                 pass
 
         self.rescan()   # Dateien liegen wieder am Ursprungsort
+        by_key = self._entries_by_key()
         for key, slot in action.get("slots", []):
-            entry = self._entry_by_key(key)
+            entry = by_key.get(key)
             if entry is not None:
                 entry.slot = slot
         self._save_marks()
         self.refresh_view()
         self.status.config(
-            text=f"Rückgängig: {len(ops) - failed - changed} von {len(ops)} Datei(en)"
+            text=f"Rückgängig: {len(ops) - failed - changed - blocked} von {len(ops)} Datei(en)"
                  + (f", {changed} seither verändert und deshalb behalten" if changed else "")
+                 + (f", {blocked} im Ziel gelassen, weil am Ursprungsort inzwischen "
+                    "eine andere Datei liegt" if blocked else "")
                  + (f", {failed} fehlgeschlagen" if failed else ""))
 
     # -- Bearbeitung -------------------------------------------------------
@@ -1443,12 +1984,14 @@ class App(tk.Tk):
     def toggle_develop(self) -> None:
         self.dev_mode.set(not self.dev_mode.get())
         if self.dev_mode.get():
-            self.pane.add(self.dev_panel, weight=0)
-            self.after(50, lambda: self.pane.sashpos(1, self.pane.winfo_width() - 280))
+            # Neben das PanedWindow, nicht hinein: dort stellte dessen
+            # Platzverteilung die gesetzte Trennlinie wieder zurueck und das
+            # Panel blieb schmal. So bekommt es immer die Breite seines Inhalts.
+            self.dev_panel.pack(side=tk.RIGHT, fill=tk.Y, before=self.pane)
             self._sync_dev_panel()
         else:
             self.crop_mode.set(False)
-            self.pane.forget(self.dev_panel)
+            self.dev_panel.pack_forget()
         self.show_current()
 
     def toggle_crop(self) -> None:
@@ -1527,7 +2070,7 @@ class App(tk.Tk):
     def _after_dev_change(self) -> None:
         self._render_job = None
         self._dev_pending = None
-        self._save_marks()
+        self._mark_dirty()
         if self.view:
             self._update_row(self.index)
         self.show_current()
@@ -1564,32 +2107,32 @@ class App(tk.Tk):
         entry = self.current_entry()
         if entry is None or self._dev_clipboard is None:
             return
+        target = self.dev_for(entry)
         self._push_undo({"type": "develop", "key": str(entry.preview),
-                         "old": self.dev_for(entry).to_dict()})
-        new = self._dev_clipboard.copy()
-        new.crop = None      # Zuschnitt ist bildspezifisch
-        self.develop[str(entry.master)] = new
+                         "old": target.to_dict()})
+        self.develop[str(entry.master)] = self._dev_clipboard.transferred_to(target)
         self._sync_dev_panel()
         self._after_dev_change()
 
     def apply_develop_to_all(self) -> None:
+        """Einstellungen auf alle angezeigten Aufnahmen - der Filter bestimmt, welche."""
         entry = self.current_entry()
         if entry is None:
             return
-        targets = [e for e in self.entries if e.slot] or list(self.entries)
+        targets = list(self.view)
+        shown = "" if self.filter_mode.get() == "Alle" else f" (Filter „{self.filter_mode.get()}“)"
         if not messagebox.askokcancel(
                 "PhotoSelection",
-                f"Einstellungen von {entry.stem} auf {len(targets)} Aufnahme(n) "
-                "übertragen?\nDer Zuschnitt wird nicht übertragen."):
+                f"Einstellungen von {entry.stem} auf alle {len(targets)} angezeigten "
+                f"Aufnahmen{shown} übertragen?\n\n"
+                "Zuschnitt, Drehung und Geraderichten bleiben bildspezifisch."):
             return
-        source = self.dev_for(entry)
+        source = self.dev_for(entry).copy()
         self._push_undo({"type": "develop_many",
                          "items": [(str(t.preview), self.dev_for(t).to_dict())
                                    for t in targets]})
         for target in targets:
-            new = source.copy()
-            new.crop = self.develop.get(str(target.master), Develop()).crop
-            self.develop[str(target.master)] = new
+            self.develop[str(target.master)] = source.transferred_to(self.dev_for(target))
         self._save_marks()
         self.refresh_view()
         self.status.config(text=f"Einstellungen auf {len(targets)} Aufnahmen übertragen.")
@@ -1605,21 +2148,47 @@ class App(tk.Tk):
             return
 
         entry = self.view[self.index]
-        self.loader.request([self.view[i].preview
+        self.loader.request([(self.view[i].preview, self.view[i].preview)
                              for i in (self.index, self.index + 1, self.index - 1,
                                        self.index + 2, self.index - 2)
                              if 0 <= i < len(self.view)])
 
         dev = self.dev_for(entry)
-        base, self._loading_dev = None, False
-        extra_ev = 0.0
-        if self.dev_mode.get():
-            key = self.developer.request(entry.master, dev)
-            base = self.developer.get(key)
-            self._loading_dev = base is None
-            extra_ev = pending_exposure(entry.master, dev)
+        prev = self._preview_of(entry)
+        full_size = prev.full_size if prev is not None else None
+        # Braucht der Zoom mehr Pixel, als die Vorschau hat? Dann wird die volle
+        # Aufloesung im Hintergrund geholt und solange die Vorschau vergroessert
+        want_full = (self.zoom is not None and not self.crop_mode.get()
+                     and prev is not None and prev.image is not None
+                     and self.zoom * self._ratio(full_size, prev.image) > 1.05)
+        base, extra_ev, gains, note = None, 0.0, None, ""
 
-        prev = self.loader.get(entry.preview)
+        if self.dev_mode.get():
+            raw = is_raw(entry.master)
+            half_key = (str(entry.master), True) + dev.base_key(raw)
+            full_key = (str(entry.master), False) + dev.base_key(raw)
+            half = self.developer.get(half_key)
+            need_full = (self.zoom is not None and not self.crop_mode.get()
+                         and isinstance(half, Image.Image)
+                         and self.zoom * self._ratio(full_size, half) > 1.05)
+            jobs = [(half_key, entry.master, dev.copy(), True)]
+            if need_full:
+                jobs.append((full_key, entry.master, dev.copy(), False))
+            self.developer.request(jobs)
+            full = self.developer.get(full_key) if need_full else None
+            for result in (full, half):
+                if isinstance(result, Image.Image):
+                    base = result
+                    break
+            if isinstance(half, Failed):
+                note = "Entwicklung fehlgeschlagen – zeige das Kamera-JPEG"
+            elif half is None:
+                note = "entwickle…"
+            elif need_full and full is None:
+                note = "entwickle 100 %…"
+            if base is not None:
+                extra_ev = pending_exposure(entry.master, dev)
+
         if base is None:
             if prev is None:
                 self.canvas.delete("all")
@@ -1634,12 +2203,34 @@ class App(tk.Tk):
                 return
             # Notbehelf: das Kamera-JPEG mit genäherter Belichtung und WB
             base = prev.image
+            if want_full:
+                full = self.full_loader.get(entry.preview)
+                if full is None:
+                    self.full_loader.request([(entry.preview, entry.preview)])
+                    note = note or "lade 100 %…"
+                elif isinstance(full, Image.Image):
+                    base = full
+                else:
+                    note = note or "100 % nicht verfügbar – zeige die Vorschau vergrößert"
             if dev.wb == "Kelvin":
-                base = _apply_gains(base, _kelvin_gains(dev.kelvin, dev.tint), 0.0)
+                gains = _kelvin_gains(dev.kelvin, dev.tint)
             extra_ev = dev.exposure
+        if not want_full:
+            self.full_loader.request([])   # nicht mehr gebraucht
 
-        self._render(base, dev, prev, extra_ev)
+        self._render(base, dev, prev, extra_ev, gains, full_size, note)
         self._update_status()
+
+    def _preview_of(self, entry: Entry) -> Preview | None:
+        prev = self.loader.get(entry.preview)
+        if isinstance(prev, Failed):   # load_preview faengt selbst alles ab - zur Sicherheit
+            return Preview(error=prev.message)
+        return prev
+
+    @staticmethod
+    def _ratio(full_size, img: Image.Image) -> float:
+        """Originalpixel je Pixel von img."""
+        return max(full_size) / max(img.size) if full_size else 1.0
 
     def _render_error(self, message: str) -> None:
         self.canvas.delete("all")
@@ -1648,19 +2239,35 @@ class App(tk.Tk):
                                 text=f"Bild kann nicht gelesen werden:\n{message}")
         self._photo = None
 
+    def _straightened(self, base: Image.Image, dev: Develop) -> Image.Image:
+        """Gedrehtes Bild - zwischengespeichert.
+
+        Drehen kostet bei 3000 px mehrere hundert Millisekunden, und Schwenken
+        oder Zuschnitt-Ziehen zeichnet staendig neu.
+        """
+        key = (dev.orient, round(dev.angle, 2))
+        cache = self._geo_cache
+        if cache is None or cache[0] is not base or cache[1] != key:
+            cache = self._geo_cache = (base, key, straighten(base, dev))
+        return cache[2]
+
     def _render(self, base: Image.Image, dev: Develop, prev: Preview | None,
-                extra_ev: float = 0.0) -> None:
+                extra_ev: float = 0.0, gains=None, full_size=None, note: str = "") -> None:
         self.canvas.delete("all")
         cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
         if cw < 2 or ch < 2:
             return
 
         cropping = self.crop_mode.get()
-        img = straighten(base, dev) if cropping else apply_geometry(base, dev)
+        straight = self._straightened(base, dev)
+        self._straight_size = straight.size
+        img = straight if cropping else crop_to(straight, dev.crop)
 
         w, h = img.size
+        ratio = self._ratio(full_size, base)
         fit = min(cw / w, ch / h)
-        scale = fit if (self.zoom is None or cropping) else self.zoom
+        scale = fit if (self.zoom is None or cropping) else self.zoom * ratio
+        self._zoom_info = (fit / ratio, w * ratio, h * ratio)
         disp_w = min(cw, max(1, round(w * scale)))
         disp_h = min(ch, max(1, round(h * scale)))
         # Das Runden auf ganze Bildschirmpixel kann den Ausschnitt rechnerisch
@@ -1672,18 +2279,21 @@ class App(tk.Tk):
         view = img.resize((disp_w, disp_h), resample,
                           box=(x0, y0, min(x0 + src_w, w), min(y0 + src_h, h)))
 
-        view = apply_rgb(view, dev, extra_ev)
+        # Farbe erst auf dem Bildschirmausschnitt rechnen, nicht auf dem ganzen Bild
+        if gains is not None or extra_ev:
+            view = _apply_gains(view, gains, extra_ev)
+        view = apply_rgb(view, dev)
+        # Histogramm vor den Einblendungen - sonst zaehlen EXIF-Feld und
+        # Clipping-Farben mit
+        hist = histogram_of(view) if self.show_hist.get() and not cropping else None
         if self.show_clip.get():
             view = mark_clipping(view)
 
         entry = self.view[self.index]
         if self.show_exif.get() and prev is not None and not cropping:
-            draw_exif_panel(view, prev, entry)
-        if self.show_hist.get() and not cropping:
-            hist = histogram_of(view) if self.dev_mode.get() else \
-                (prev.hist if prev is not None else None)
-            if hist is not None:
-                draw_histogram(view, hist)
+            draw_exif_panel(view, prev, entry, self.ui_scale)
+        if hist is not None:
+            draw_histogram(view, hist, self.ui_scale)
 
         self._photo = ImageTk.PhotoImage(view)
         left, top = (cw - disp_w) // 2, (ch - disp_h) // 2
@@ -1695,19 +2305,27 @@ class App(tk.Tk):
         elif entry.slot:
             self._draw_slot_badge(entry, cw, ch)
 
-        if self._loading_dev:
-            self.canvas.create_text(cw // 2, ch - 22, text="entwickle…", fill="#f2e14c",
+        if note:
+            self.canvas.create_text(cw // 2, ch - self.px(22), text=note, fill="#f2e14c",
                                     font=("Segoe UI", 11, "bold"))
+        if self.zoom is not None and not cropping:
+            self.canvas.create_text(self.px(14), ch - self.px(14), anchor="sw",
+                                    text=f"{self.zoom * 100:.0f} %"
+                                         + ("  ·  Zoom gehalten" if self.keep_zoom.get() else ""),
+                                    fill="#dddddd", font=("Segoe UI", 10, "bold"))
 
     def _draw_slot_badge(self, entry: Entry, cw: int, ch: int) -> None:
         color = SLOT_COLORS[entry.slot]
-        self.canvas.create_rectangle(3, 3, cw - 3, ch - 3, outline=color, width=5)
+        self.canvas.create_rectangle(3, 3, cw - 3, ch - 3, outline=color, width=self.px(5))
         title = self.slots[entry.slot].title
         text = f" {entry.slot} {title} " if title else f" {entry.slot} "
-        self.canvas.create_rectangle(cw - 14 - 9 * len(text), 12, cw - 12, 40,
-                                     fill=color, outline=color)
-        self.canvas.create_text(cw - 14, 26, text=text, anchor="e", fill="#111",
-                                font=("Segoe UI", 11, "bold"))
+        label = self.canvas.create_text(cw - self.px(14), self.px(26), text=text, anchor="e",
+                                        fill="#111", font=("Segoe UI", 11, "bold"))
+        x0, y0, x1, y1 = self.canvas.bbox(label)
+        pad = self.px(2)
+        box = self.canvas.create_rectangle(x0 - pad, y0 - pad, x1 + pad, y1 + pad,
+                                           fill=color, outline=color)
+        self.canvas.tag_lower(box, label)
 
     def _draw_crop_overlay(self, dev: Develop) -> None:
         if not self._img_box:
@@ -1731,38 +2349,47 @@ class App(tk.Tk):
             self.canvas.create_line(cx0, cy0 + (cy1 - cy0) * i / 3,
                                     cx1, cy0 + (cy1 - cy0) * i / 3,
                                     fill="#cccccc", dash=(3, 4))
+        r = self.px(6)
         for hx, hy in ((cx0, cy0), (cx1, cy0), (cx0, cy1), (cx1, cy1)):
-            self.canvas.create_rectangle(hx - 6, hy - 6, hx + 6, hy + 6,
+            self.canvas.create_rectangle(hx - r, hy - r, hx + r, hy + r,
                                          fill="#ffffff", outline="#333")
 
     def _update_status(self) -> None:
         self._refresh_slot_panel()
-        if not self.view:
-            self.status.config(text="Keine Bilder im gewählten Ordner."
-                               if self.source else "Quellordner wählen…")
+        if self._busy and self._progress:
+            self.status.config(text=self._progress)   # Fortschritt nicht ueberschreiben
             return
-        entry = self.view[self.index]
-        size = sum(f.stat().st_size for f in entry.files if f.exists()) / 1e6
-        prev = self.loader.get(entry.preview)
-        sharp = f"Schärfe {prev.sharpness:.0f}" if prev and prev.image else "…"
-        target = (self.slots[entry.slot].title or f"Ordner {entry.slot}") \
-            if entry.slot else "offen"
-        dev = self.dev_for(entry)
-        mode = "Entwicklung" if self.dev_mode.get() else "Vorschau"
-        edited = " · bearbeitet" if not dev.is_default() else ""
-        self.status.config(
-            text=f"{self.index + 1}/{len(self.view)}   {entry.label}   {size:.1f} MB   "
-                 f"→ {target}   {sharp}   {mode}{edited}")
+        if not self.view:
+            text = "Keine Bilder im gewählten Ordner." if self.source else "Quellordner wählen…"
+        else:
+            entry = self.view[self.index]
+            try:
+                size = sum(f.stat().st_size for f in entry.files if f.exists()) / 1e6
+            except OSError:
+                size = 0.0
+            prev = self._preview_of(entry)
+            sharp = f"Schärfe {prev.sharpness:.0f}" if prev and prev.image else "…"
+            target = (self.slots[entry.slot].title or f"Ordner {entry.slot}") \
+                if entry.slot else "offen"
+            dev = self.dev_for(entry)
+            mode = "Entwicklung" if self.dev_mode.get() else "Vorschau"
+            edited = " · bearbeitet" if not dev.is_default() else ""
+            text = (f"{self.index + 1}/{len(self.view)}   {entry.label}   {size:.1f} MB   "
+                    f"→ {target}   {sharp}   {mode}{edited}")
+        if self._save_error:
+            text += f"   ⚠ {self._save_error}"
+        self.status.config(text=text)
 
     def _poll(self) -> None:
         refresh = False
-        try:
-            while True:
-                path = self.loader.done.get_nowait()
-                if self.view and path == self.view[self.index].preview:
-                    refresh = True
-        except queue.Empty:
-            pass
+        current = self.view[self.index].preview if self.view else None
+        for worker in (self.loader, self.full_loader):
+            try:
+                while True:
+                    if worker.done.get_nowait() == current:
+                        refresh = True
+            except queue.Empty:
+                pass
         try:
             while True:
                 self.developer.done.get_nowait()
@@ -1777,6 +2404,7 @@ class App(tk.Tk):
             while True:
                 kind, payload = self.worker_q.get_nowait()
                 if kind == "progress":
+                    self._progress = payload
                     self.status.config(text=payload)
                 elif kind == "done":
                     self._run_done(*payload)
@@ -1791,6 +2419,15 @@ class App(tk.Tk):
             self.after_cancel(self._resize_job)
         self._resize_job = self.after(80, self.show_current)
 
+    def _schedule_render(self) -> None:
+        """Beim Ziehen hoechstens alle 15 ms neu zeichnen statt bei jedem Maus-Ereignis."""
+        if self._drag_job is None:
+            self._drag_job = self.after(15, self._scheduled_render)
+
+    def _scheduled_render(self) -> None:
+        self._drag_job = None
+        self.show_current()
+
     def rotate(self, deg: int) -> None:
         entry = self.current_entry()
         if entry is None:
@@ -1803,30 +2440,18 @@ class App(tk.Tk):
         self._after_dev_change()
 
     def set_zoom(self, value: float | None) -> None:
+        """value: Bildschirmpixel je Originalpixel - 1.0 ist echte 100 %."""
         self.zoom = value
         if value is None:
             self.center = (0.5, 0.5)
         self.show_current()
 
-    def _display_image_size(self) -> tuple[int, int] | None:
-        entry = self.current_entry()
-        if entry is None:
-            return None
-        prev = self.loader.get(entry.preview)
-        if prev is None or prev.image is None:
-            return None
-        return prev.image.size
-
     def _on_wheel(self, event) -> None:
-        if self.crop_mode.get():
+        if self.crop_mode.get() or not self._zoom_info:
             return
-        size = self._display_image_size()
-        if size is None:
-            return
-        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        fit = min(cw / size[0], ch / size[1])
+        fit = self._zoom_info[0]
         current = fit if self.zoom is None else self.zoom
-        new = max(fit * 0.9, min(current * (1.25 if event.delta > 0 else 0.8), 8.0))
+        new = max(fit, min(current * (1.25 if event.delta > 0 else 0.8), 8.0))
         self.zoom = None if new <= fit * 1.001 else new
         self.show_current()
 
@@ -1841,22 +2466,36 @@ class App(tk.Tk):
         if self.crop_mode.get():
             self._update_crop(event)
             return
-        size = self._display_image_size()
-        if not self._drag or self.zoom is None or size is None:
+        if not self._drag or self.zoom is None or not self._zoom_info:
             return
+        _, width, height = self._zoom_info
         dx, dy = event.x - self._drag[0], event.y - self._drag[1]
         self._drag = (event.x, event.y)
         self.center = (
-            min(max(self.center[0] - dx / (self.zoom * size[0]), 0.0), 1.0),
-            min(max(self.center[1] - dy / (self.zoom * size[1]), 0.0), 1.0),
+            min(max(self.center[0] - dx / (self.zoom * width), 0.0), 1.0),
+            min(max(self.center[1] - dy / (self.zoom * height), 0.0), 1.0),
         )
-        self.show_current()
+        self._schedule_render()
 
     def _on_release(self, _event) -> None:
         self._drag = None
-        if self._crop_drag is not None:
-            self._crop_drag = None
-            self._after_dev_change()
+        if self._crop_drag is None:
+            return
+        kind, _, start = self._crop_drag
+        self._crop_drag = None
+        entry = self.current_entry()
+        if entry is None:
+            return
+        dev = self.dev_for(entry)
+        x0, y0, x1, y1 = dev.crop or (0.0, 0.0, 1.0, 1.0)
+        if kind == "new" and (x1 - x0 < 0.01 or y1 - y0 < 0.01):
+            dev.crop = start   # nur geklickt, nichts aufgezogen
+        # Ein Undo-Schritt nur, wenn sich wirklich etwas geaendert hat
+        if self._crop_before is not None and dev.to_dict() != self._crop_before:
+            self._push_undo({"type": "develop", "key": str(entry.preview),
+                             "old": self._crop_before})
+        self._crop_before = None
+        self._after_dev_change()
 
     # -- Zuschnitt mit der Maus -------------------------------------------
 
@@ -1870,16 +2509,16 @@ class App(tk.Tk):
         if entry is None or not self._img_box:
             return
         dev = self.dev_for(entry)
-        self._push_undo({"type": "develop", "key": str(entry.preview),
-                         "old": dev.to_dict()})
+        self._crop_before = dev.to_dict()
         rect = dev.crop or (0.0, 0.0, 1.0, 1.0)
         left, top, dw, dh = self._img_box
         rx, ry = self._canvas_to_rel(event.x, event.y)
 
+        grab = self.px(10)
         corners = {"nw": (rect[0], rect[1]), "ne": (rect[2], rect[1]),
                    "sw": (rect[0], rect[3]), "se": (rect[2], rect[3])}
         for name, (cx, cy) in corners.items():
-            if abs(cx * dw + left - event.x) <= 10 and abs(cy * dh + top - event.y) <= 10:
+            if abs(cx * dw + left - event.x) <= grab and abs(cy * dh + top - event.y) <= grab:
                 self._crop_drag = ("corner", name, rect)
                 return
         if rect[0] < rx < rect[2] and rect[1] < ry < rect[3]:
@@ -1895,10 +2534,12 @@ class App(tk.Tk):
         dev = self.dev_for(entry)
         kind, anchor, start = self._crop_drag
         rx, ry = self._canvas_to_rel(event.x, event.y)
+        fixed = None    # Ecke, die beim Erzwingen des Seitenverhaeltnisses stehen bleibt
 
         if kind == "new":
             ax, ay = anchor
             rect = (min(ax, rx), min(ay, ry), max(ax, rx), max(ay, ry))
+            fixed = ("s" if ry < ay else "n") + ("e" if rx < ax else "w")
         elif kind == "corner":
             x0, y0, x1, y1 = start
             if anchor == "nw":
@@ -1909,6 +2550,7 @@ class App(tk.Tk):
                 rect = (min(rx, x1 - 0.02), y0, x1, max(ry, y0 + 0.02))
             else:
                 rect = (x0, y0, max(rx, x0 + 0.02), max(ry, y0 + 0.02))
+            fixed = {"nw": "se", "ne": "sw", "sw": "ne", "se": "nw"}[anchor]
         else:
             ax, ay = anchor
             dx, dy = rx - ax, ry - ay
@@ -1918,28 +2560,31 @@ class App(tk.Tk):
             rect = (nx, ny, nx + w, ny + h)
 
         rect = tuple(min(max(v, 0.0), 1.0) for v in rect)
-        dev.crop = self._constrain(rect, dev.ratio)
-        self.show_current()
+        dev.crop = self._constrain(rect, dev.ratio, fixed) if fixed else rect
+        self._schedule_render()
 
-    def _constrain(self, rect, ratio_name: str):
-        """Seitenverhaeltnis erzwingen - relativ, also mit den Bildmassen gewichtet."""
+    def _constrain(self, rect, ratio_name: str, fixed: str = "nw"):
+        """Seitenverhaeltnis erzwingen - die Ecke `fixed` bleibt stehen.
+
+        Gerechnet wird relativ, also mit den Massen des geraden Bildes
+        gewichtet (grobe Drehung und Geraderichten sind darin schon enthalten).
+        """
         target = RATIOS.get(ratio_name)
-        if not target:
+        if not target or not self._straight_size:
             return rect
-        # Die Kantenlaengen des angezeigten Bildes - sie beruecksichtigen bereits
-        # grobe Drehung und Geraderichten
-        size = self._img_box[2:] if self._img_box else self._display_image_size()
-        if not size:
-            return rect
-        iw, ih = size
+        iw, ih = self._straight_size
+        k = iw / (target * ih)          # relative Hoehe je relativer Breite
         x0, y0, x1, y1 = rect
-        rel_w = x1 - x0
-        rel_h = rel_w * iw / (target * ih)
-        if y0 + rel_h > 1.0:
-            rel_h = 1.0 - y0
-            rel_w = rel_h * target * ih / iw
-            x1 = min(x0 + rel_w, 1.0)
-        return (x0, y0, x1, min(y0 + rel_h, 1.0))
+        east, south = fixed[1] == "e", fixed[0] == "s"
+        fx, fy = (x1 if east else x0), (y1 if south else y0)
+        room_w = fx if east else 1.0 - fx
+        room_h = fy if south else 1.0 - fy
+        width = max(x1 - x0, (y1 - y0) / k)    # dem groesseren Ausschlag folgen
+        width = min(width, room_w, room_h / k)
+        height = width * k
+        nx0 = fx - width if east else fx
+        ny0 = fy - height if south else fy
+        return (nx0, ny0, nx0 + width, ny0 + height)
 
     def toggle_fullscreen(self) -> None:
         self.attributes("-fullscreen", not self.attributes("-fullscreen"))
@@ -1957,11 +2602,12 @@ class App(tk.Tk):
         develop = tk.BooleanVar(value=self.export_cfg["develop"])
         mode = tk.StringVar(value=self.export_cfg["mode"])
         quality = tk.IntVar(value=self.export_cfg["quality"])
-        strip_gps = tk.BooleanVar(value=self.export_cfg["strip_gps"])
+        strip_private = tk.BooleanVar(value=self.export_cfg["strip_gps"])
         edge = tk.StringVar(value=next((k for k, v in LONG_EDGES.items()
                                         if v == self.export_cfg["long_edge"]), "Original"))
 
-        ttk.Checkbutton(body, text="RAW als JPG entwickeln", variable=develop).pack(anchor="w")
+        ttk.Checkbutton(body, text="RAW und bearbeitete Aufnahmen als JPG entwickeln",
+                        variable=develop).pack(anchor="w")
         ttk.Radiobutton(body, text=f"zusätzlich zur RAW-Datei (Unterordner „{DEV_SUBDIR}“)",
                         variable=mode, value="zusaetzlich").pack(anchor="w", padx=20)
         ttk.Radiobutton(body, text="statt der RAW-Datei (Originale bleiben in der Quelle)",
@@ -1977,22 +2623,27 @@ class App(tk.Tk):
         ttk.Combobox(row, textvariable=edge, values=list(LONG_EDGES), width=12,
                      state="readonly").pack(side=tk.LEFT)
 
-        ttk.Checkbutton(body, text="Standortdaten (GPS) aus der Ausgabe entfernen",
-                        variable=strip_gps).pack(anchor="w", pady=(10, 0))
+        ttk.Checkbutton(body, text="Standort (GPS) und Seriennummern aus der Ausgabe entfernen",
+                        variable=strip_private).pack(anchor="w", pady=(10, 0))
 
-        ttk.Label(body, foreground="#666", wraplength=360, justify="left",
+        ttk.Label(body, foreground="#666", wraplength=self.px(380), justify="left",
                   text="Entwickelt wird mit den Einstellungen der jeweiligen Aufnahme. "
-                       "Aufnahmen ohne Bearbeitung werden neutral entwickelt. Das dauert "
-                       "je RAW rund 4–25 Sekunden.\n\n"
+                       "RAWs ohne Bearbeitung werden neutral entwickelt, das dauert je "
+                       "RAW rund 4–25 Sekunden. Unbearbeitete JPGs werden nicht neu "
+                       "komprimiert, sondern wie gewohnt kopiert.\n\n"
                        "Kamera, Objektiv, Blende, Zeit und ISO werden immer übernommen. "
-                       "Der Aufnahmeort nur, wenn der Haken oben entfernt wird — "
-                       "exportierte JPGs sind das, was man weitergibt."
+                       "Aufnahmeort, Seriennummern und Herstellerdaten nur, wenn der "
+                       "Haken oben entfernt wird — exportierte JPGs sind das, was man "
+                       "weitergibt."
                   ).pack(anchor="w", pady=(6, 0))
 
         def save():
-            self.export_cfg.update(develop=develop.get(), mode=mode.get(),
-                                   quality=int(quality.get()),
-                                   strip_gps=strip_gps.get(),
+            try:
+                q = min(max(int(quality.get()), 60), 100)
+            except (tk.TclError, ValueError):   # Unsinn im Eingabefeld
+                q = self.export_cfg["quality"]
+            self.export_cfg.update(develop=develop.get(), mode=mode.get(), quality=q,
+                                   strip_gps=strip_private.get(),
                                    long_edge=LONG_EDGES[edge.get()])
             self._save_slots()
             self._refresh_slot_panel()
@@ -2006,112 +2657,160 @@ class App(tk.Tk):
 
     # -- Ausführen ---------------------------------------------------------
 
+    @staticmethod
+    def _same_dir(a: Path, b: Path) -> bool:
+        try:
+            return a.resolve() == b.resolve()
+        except OSError:
+            return a == b
+
     def run_assignments(self) -> None:
-        if self._busy or not self.source:
+        if self._busy:   # der Knopf heisst waehrenddessen "Abbrechen"
+            self._cancel.set()
+            self._progress = "Breche nach der aktuellen Datei ab …"
+            self.status.config(text=self._progress)
             return
-        jobs = [(e, self.slots[e.slot]) for e in self.entries if e.slot]
-        missing = sorted({e.slot for e, s in jobs if not s.path})
+        if not self.source:
+            return
+        self._flush_marks()
+        assigned = [(e, self.slots[e.slot]) for e in self.entries if e.slot]
+        missing = sorted({e.slot for e, s in assigned if not s.path})
         if missing:
             messagebox.showwarning("PhotoSelection",
                                    "Für diese Tasten ist kein Zielordner gesetzt: "
                                    + ", ".join(str(i) for i in missing))
             return
-        if not jobs:
+        if not assigned:
             messagebox.showinfo("PhotoSelection", "Es ist nichts zugeordnet.")
             return
-        if any(s.path == self.source for _, s in jobs):
+        if any(self._same_dir(s.path, self.source) for _, s in assigned):
             messagebox.showwarning("PhotoSelection", "Ein Zielordner ist der Quellordner.")
             return
 
         cfg = dict(self.export_cfg)
         move = self.move_files.get()
-        replace = cfg["develop"] and cfg["mode"] == "statt"
-        plan = [(e, s, self.dev_for(e).copy()) for e, s in jobs]
-        n_files = 0 if replace else sum(len(e.files) for e, _, _ in plan)
-        n_dev = sum(1 for e, _, _ in plan if cfg["develop"]) if cfg["develop"] else 0
+        plan: list[Job] = []
+        for entry, slot in assigned:
+            dev = self.dev_for(entry).copy()
+            # Entwickelt werden RAWs und bearbeitete Aufnahmen - ein
+            # unbearbeitetes JPG nur neu zu komprimieren kostet bloss Qualitaet
+            develop = cfg["develop"] and (entry.raw is not None or not dev.is_default())
+            replace = develop and cfg["mode"] == "statt"
+            plan.append(Job(key=str(entry.preview), slot=entry.slot, stem=entry.stem,
+                            reldir=entry.reldir, target=Path(slot.path), master=entry.master,
+                            files=[] if replace else entry.files + entry.sidecars,
+                            dev=dev, develop=develop))
 
-        lines = [f"  {i}: {sum(len(e.files) for e, _, _ in plan if e.slot == i)} Datei(en) → "
-                 f"{self.slots[i].path}" for i in sorted({e.slot for e, _, _ in plan})]
+        n_files = sum(len(j.files) for j in plan)
+        n_dev = sum(j.develop for j in plan)
+        lines = [f"  {i}: {sum(1 for j in plan if j.slot == i)} Aufnahme(n) → "
+                 f"{self.slots[i].path}" for i in sorted({j.slot for j in plan})]
         text = f"{len(plan)} Aufnahme(n) verarbeiten?\n\n" + "\n".join(lines)
-        if cfg["develop"]:
+        if n_dev:
             text += f"\n\n{n_dev} JPG entwickeln ("
-            text += f"Unterordner „{DEV_SUBDIR}“)" if not replace else "statt der Originale)"
+            text += (f"Unterordner „{DEV_SUBDIR}“)" if cfg["mode"] != "statt"
+                     else "statt der Originale)")
             text += f"\nQualität {cfg['quality']}, lange Kante: " + (
                 f"{cfg['long_edge']} px" if cfg["long_edge"] else "Original")
         if n_files:
             text += f"\n\n{n_files} Datei(en) {'verschieben' if move else 'kopieren'}"
-        if replace and move:
-            text += "\n\nHinweis: Originale bleiben im Quellordner, da sie durch die " \
-                    "entwickelte JPG ersetzt werden."
+        if move and any(j.develop and not j.files for j in plan):
+            text += "\n\nHinweis: Originale entwickelter Aufnahmen bleiben im Quellordner, " \
+                    "da sie durch die entwickelte JPG ersetzt werden."
         if not messagebox.askokcancel("PhotoSelection", text):
             return
 
-        self._busy = True
-        self.btn_run.config(state=tk.DISABLED)
+        self._cancel.clear()
+        self._set_busy(True)
         threading.Thread(target=self._run_worker, daemon=True,
                          args=(plan, move, self.keep_tree.get(), cfg)).start()
 
-    def _run_worker(self, plan, move: bool, keep_tree: bool, cfg: dict) -> None:
-        ops: list[tuple[str, str, str, int]] = []
+    def _set_busy(self, busy: bool) -> None:
+        """Waehrend des Ausfuehrens nichts zulassen, was die Grundlage aendert."""
+        self._busy = busy
+        self._progress = ""
+        state = tk.DISABLED if busy else tk.NORMAL
+        for widget in (self.btn_source, self.chk_recursive, self.chk_pairs, self.btn_export):
+            widget.config(state=state)
+        self.cmb_sort.config(state=tk.DISABLED if busy else "readonly")
+        self._refresh_slot_panel()
+
+    def _run_worker(self, plan: list[Job], move: bool, keep_tree: bool, cfg: dict) -> None:
+        ops: list[tuple[str, str, str, tuple]] = []
         created_dirs: list[str] = []
-        done_entries: list[tuple[Entry, str, int]] = []
+        done_keys: list[tuple[str, int]] = []
         skipped = 0
         errors: list[str] = []
-        replace = cfg["develop"] and cfg["mode"] == "statt"
-        total = max(1, sum(0 if replace else len(e.files) for e, _, _ in plan)
-                    + (len(plan) if cfg["develop"] else 0))
+        cancelled = False
+        total = max(1, sum(len(j.files) + j.develop for j in plan))
         done = 0
 
-        for entry, slot, dev in plan:
-            entry_ok = True
-            key = str(entry.preview)
-            rel_dir = Path(entry.reldir) if (keep_tree and entry.reldir != ".") else Path()
+        try:
+            for job in plan:
+                if self._cancel.is_set():
+                    cancelled = True
+                    break
+                job_ok = True
+                rel_dir = Path(job.reldir) if (keep_tree and job.reldir != ".") else Path()
+                folder = job.target / rel_dir
+                master = job.master       # wandert beim Verschieben mit
+                dev_stem = job.stem
 
-            if not replace:
-                for src in entry.files:
-                    done += 1
+                targets = []
+                if job.files:
                     try:
-                        self._ensure_dir(slot.path / rel_dir, slot.path, created_dirs)
-                        dest = self._prepare(slot.path / rel_dir / src.name, src)
-                        if dest is None:
-                            skipped += 1
-                            continue
-                        if move:
-                            shutil.move(str(src), str(dest))
-                            ops.append((str(src), str(dest), "move",
-                                        dest.stat().st_size))
-                        else:
-                            shutil.copy2(src, dest)
-                            ops.append((str(src), str(dest), "copy",
-                                        dest.stat().st_size))
+                        self._ensure_dir(folder, job.target, created_dirs)
+                        targets = self._plan_names(job.files, folder, job.stem)
                     except Exception as exc:
-                        entry_ok = False
+                        job_ok = False
+                        errors.append(f"{job.stem}: {exc}")
+                for src, dest, already_there in targets:
+                    done += 1
+                    if src == job.master:
+                        dev_stem = Path(dest.name).stem   # IMG_1_2.jpg zu IMG_1_2.CR2
+                    if already_there:
+                        skipped += 1
+                        continue
+                    try:
+                        kind, problem = self._transfer(src, dest, move)
+                        ops.append((str(src), str(dest), kind, _signature(dest)))
+                        if kind == "move" and src == job.master:
+                            master = dest
+                        if problem:
+                            job_ok = False
+                            errors.append(f"{src.name}: {problem}")
+                    except Exception as exc:
+                        job_ok = False
                         errors.append(f"{src.name}: {exc}")
                     self.worker_q.put(("progress",
                                        f"{'Verschiebe' if move else 'Kopiere'} "
-                                       f"{done}/{total} …"))
+                                       f"{done}/{total} …  (Knopf „Abbrechen“ hält an)"))
 
-            if cfg["develop"]:
-                done += 1
-                self.worker_q.put(("progress", f"Entwickle {entry.stem} ({done}/{total}) …"))
-                try:
-                    folder = slot.path / rel_dir if replace else \
-                        slot.path / DEV_SUBDIR / rel_dir
-                    self._ensure_dir(folder, slot.path, created_dirs)
-                    dest = self._prepare(folder / (entry.stem + ".jpg"))
-                    export_jpeg(entry.master, dev, dest, cfg["quality"],
-                                cfg["long_edge"], cfg["strip_gps"])
-                    ops.append((str(entry.master), str(dest), "develop",
-                                dest.stat().st_size))
-                except Exception as exc:
-                    entry_ok = False
-                    errors.append(f"{entry.stem}: Entwicklung fehlgeschlagen: {exc}")
+                if job.develop:
+                    if self._cancel.is_set():
+                        cancelled = True
+                        break    # Dateien sind schon da, Entwicklung fehlt - bleibt zugeordnet
+                    done += 1
+                    self.worker_q.put(("progress", f"Entwickle {job.stem} ({done}/{total}) …"))
+                    try:
+                        dev_folder = folder if not job.files else \
+                            job.target / DEV_SUBDIR / rel_dir
+                        self._ensure_dir(dev_folder, job.target, created_dirs)
+                        dest = _free_path(dev_folder / (dev_stem + ".jpg"))
+                        export_jpeg(master, job.dev, dest, cfg["quality"],
+                                    cfg["long_edge"], cfg["strip_gps"])
+                        ops.append((str(master), str(dest), "develop", _signature(dest)))
+                    except Exception as exc:
+                        job_ok = False
+                        errors.append(f"{job.stem}: Entwicklung fehlgeschlagen: {exc}")
 
-            if entry_ok:
-                done_entries.append((entry, key, entry.slot))
-
-        self.worker_q.put(("done", (ops, created_dirs, done_entries, skipped,
-                                    errors, move)))
+                if job_ok:
+                    done_keys.append((job.key, job.slot))
+        except Exception as exc:   # darf den Abschluss nicht verhindern
+            errors.append(f"Abbruch: {type(exc).__name__}: {exc}")
+        finally:
+            self.worker_q.put(("done", (ops, created_dirs, done_keys, skipped,
+                                        errors, move, cancelled)))
 
     @staticmethod
     def _ensure_dir(folder: Path, root: Path, created: list[str]) -> None:
@@ -2129,43 +2828,86 @@ class App(tk.Tk):
         created.extend(str(p) for p in missing if p != root)
 
     @staticmethod
-    def _prepare(dest: Path, src: Path | None = None) -> Path | None:
-        """Kollisionen aufloesen. None = ueberspringen.
+    def _plan_names(files: list[Path], folder: Path, stem: str) -> list[tuple[Path, Path, bool]]:
+        """Zielnamen fuer alle Dateien einer Aufnahme: (Quelle, Ziel, schon da).
 
-        Gleich grosse Datei am Ziel gilt als schon vorhanden. Sonst wird
-        ausgewichen - ueberschrieben wird nie.
+        Eine inhaltsgleiche Datei am Ziel gilt als schon kopiert. Alles andere
+        wird nie ueberschrieben - dann weicht die ganze Aufnahme gemeinsam auf
+        _1, _2 ... aus. RAW, JPG und XMP muessen gleich heissen, sonst findet
+        z. B. Lightroom die Bearbeitung nicht mehr.
         """
-        if not dest.exists():
-            return dest
-        if src is not None and dest.stat().st_size == src.stat().st_size:
-            return None
-        return App._unique(dest)
+        for n in range(10000):
+            plan = []
+            for src in files:
+                dest = folder / (src.name if n == 0 else _numbered(src.name, stem, n))
+                if not dest.exists():
+                    plan.append((src, dest, False))
+                elif _same_content(src, dest):
+                    plan.append((src, dest, True))
+                else:
+                    break   # belegt - naechste Nummer fuer alle
+            else:
+                return plan
+        raise FileExistsError(f"kein freier Name für {stem} in {folder}")
 
     @staticmethod
-    def _unique(dest: Path) -> Path:
-        n = 1
-        while True:
-            candidate = dest.with_name(f"{dest.stem}_{n}{dest.suffix}")
-            if not candidate.exists():
-                return candidate
-            n += 1
+    def _transfer(src: Path, dest: Path, move: bool) -> tuple[str, str | None]:
+        """Kopieren oder verschieben, ohne je zu ueberschreiben.
 
-    def _run_done(self, ops, created_dirs, done_entries, skipped, errors, move) -> None:
-        self._busy = False
-        self.btn_run.config(state=tk.NORMAL)
+        Gibt die tatsaechliche Art ("move"/"copy") und ggf. ein Problem zurueck.
+        Kopiert wird ueber eine .part-Datei - ein Abbruch hinterlaesst so keine
+        halbe Datei unter dem richtigen Namen.
+        """
+        if dest.exists():
+            raise FileExistsError(f"existiert bereits: {dest}")
+        if move:
+            try:
+                os.rename(src, dest)   # gleiches Laufwerk: sofort und vollstaendig
+                return "move", None
+            except OSError:
+                if dest.exists():
+                    raise
+        part = dest.with_name(f".{dest.name}.part")
+        try:
+            shutil.copy2(src, part)
+        except BaseException:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+            raise
+        _publish(part, dest)
+        if not move:
+            return "copy", None
+        try:
+            os.unlink(src)   # erst, wenn die Kopie vollstaendig am Ziel liegt
+        except OSError as exc:
+            return "copy", f"kopiert, Original aber nicht entfernt: {exc}"
+        return "move", None
+
+    def _run_done(self, ops, created_dirs, done_keys, skipped, errors, move, cancelled) -> None:
+        self._set_busy(False)
         if ops:
             self._push_undo({"type": "files", "ops": ops, "dirs": created_dirs,
-                             "slots": [(key, slot) for _, key, slot in done_entries]})
-        # Erledigte Zuordnungen zurücksetzen, damit nichts doppelt läuft
-        for entry, _, _ in done_entries:
-            entry.slot = 0
+                             "slots": list(done_keys)})
+        # Erledigte Zuordnungen zurücksetzen, damit nichts doppelt läuft - aber
+        # nur, wenn sie seit dem Start nicht geändert wurden
+        by_key = self._entries_by_key()
+        for key, slot in done_keys:
+            entry = by_key.get(key)
+            if entry is not None and entry.slot == slot:
+                entry.slot = 0
         self._save_marks()
+        if self._close_after_run:
+            self._on_close()
+            return
 
         kinds = [k for _, _, k, _ in ops]
-        msg = (f"{kinds.count('move')} verschoben, {kinds.count('copy')} kopiert, "
-               f"{kinds.count('develop')} entwickelt.\n"
-               f"{skipped} übersprungen (bereits vorhanden).\n\n"
-               "Strg+Z macht den Vorgang rückgängig.")
+        msg = ("Abgebrochen.\n\n" if cancelled else "") + (
+            f"{kinds.count('move')} verschoben, {kinds.count('copy')} kopiert, "
+            f"{kinds.count('develop')} entwickelt.\n"
+            f"{skipped} übersprungen (inhaltsgleich bereits vorhanden).\n\n"
+            "Strg+Z macht den Vorgang rückgängig.")
         if errors:
             msg += "\n\nFehler:\n" + "\n".join(errors[:10])
             if len(errors) > 10:
@@ -2182,10 +2924,21 @@ class App(tk.Tk):
             self.refresh_view()
 
     def _on_close(self) -> None:
+        if self._busy:
+            if not messagebox.askokcancel(
+                    "PhotoSelection",
+                    "Die Zuordnungen werden gerade ausgeführt.\n\n"
+                    "Nach der aktuellen Datei abbrechen und beenden?"):
+                return
+            self._cancel.set()
+            self._close_after_run = True   # _run_done schliesst dann
+            self._progress = "Beende nach der aktuellen Datei …"
+            self.status.config(text=self._progress)
+            return
         self._save_marks()
         self._save_slots()
         # Anstehende Timer abbestellen, sonst laufen sie ins zerstoerte Fenster
-        for job in (self._poll_job, self._resize_job, self._render_job):
+        for job in (self._poll_job, self._resize_job, self._render_job, self._drag_job):
             if job:
                 try:
                     self.after_cancel(job)
@@ -2198,6 +2951,7 @@ class App(tk.Tk):
 # Overlays
 # --------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=16)
 def _font(size: int):
     for name in ("segoeui.ttf", "DejaVuSans.ttf", "arial.ttf"):
         try:
@@ -2211,9 +2965,8 @@ def _font(size: int):
 
 
 def histogram_of(img: Image.Image) -> np.ndarray:
-    arr = np.asarray(img.convert("RGB"), np.float32)
-    return np.stack([np.histogram(arr[:, :, c], bins=256, range=(0, 255))[0]
-                     for c in range(3)])
+    """RGB-Histogramm - PIL zaehlt in C, deutlich schneller als numpy je Kanal."""
+    return np.asarray(img.convert("RGB").histogram(), dtype=np.int64).reshape(3, 256)
 
 
 def mark_clipping(view: Image.Image) -> Image.Image:
@@ -2225,7 +2978,7 @@ def mark_clipping(view: Image.Image) -> Image.Image:
     return Image.fromarray(arr)
 
 
-def draw_exif_panel(view: Image.Image, prev: Preview, entry: Entry) -> None:
+def draw_exif_panel(view: Image.Image, prev: Preview, entry: Entry, scale: float = 1.0) -> None:
     """Aufnahmedaten und Schaerfe-Score halbtransparent oben links."""
     exif = prev.exif
     lines = [entry.stem]
@@ -2241,18 +2994,21 @@ def draw_exif_panel(view: Image.Image, prev: Preview, entry: Entry) -> None:
     if exif.get("date"):
         lines.append(exif["date"])
 
-    font, bold = _font(14), _font(15)
-    pad, line_h = 10, 19
+    def s(value: float) -> int:   # Masse fuer 96 dpi, mitwachsend
+        return round(value * scale)
+
+    font, bold = _font(s(14)), _font(s(15))
+    pad, line_h = s(10), s(19)
     width = max([int(bold.getlength(lines[0]))]
                 + [int(font.getlength(t)) for t in lines[1:]])
-    width = min(max(width, 190), max(view.width - 24, 190)) + 2 * pad
-    height = line_h * len(lines) + 26 + 2 * pad
+    width = min(max(width, s(190)), max(view.width - s(24), s(190))) + 2 * pad
+    height = line_h * len(lines) + s(26) + 2 * pad
 
     panel = Image.new("RGBA", (width, height), (0, 0, 0, 150))
     draw = ImageDraw.Draw(panel)
     y = pad
     draw.text((pad, y), lines[0], font=bold, fill=(255, 255, 255, 255))
-    y += line_h + 2
+    y += line_h + s(2)
     for text in lines[1:]:
         draw.text((pad, y), text, font=font, fill=(225, 225, 225, 255))
         y += line_h
@@ -2260,20 +3016,23 @@ def draw_exif_panel(view: Image.Image, prev: Preview, entry: Entry) -> None:
     # Schaerfe als Balken - log-skaliert, 500 gilt als knackig
     score = prev.sharpness
     frac = min(np.log10(score + 1) / np.log10(501), 1.0)
-    colour = (61, 220, 132, 255) if frac > 0.75 else \
-             (242, 225, 76, 255) if frac > 0.5 else (224, 108, 117, 255)
-    draw.text((pad, y + 2), f"Schärfe {score:.0f}", font=font, fill=(200, 200, 200, 255))
-    bar_x = pad + 96
-    draw.rectangle([bar_x, y + 8, width - pad, y + 16], fill=(255, 255, 255, 40))
-    draw.rectangle([bar_x, y + 8, bar_x + (width - pad - bar_x) * frac, y + 16], fill=colour)
+    colour = (61, 220, 132, 255) if frac > 0.75 else              (242, 225, 76, 255) if frac > 0.5 else (224, 108, 117, 255)
+    draw.text((pad, y + s(2)), f"Schärfe {score:.0f}", font=font, fill=(200, 200, 200, 255))
+    bar_x = pad + s(96)
+    draw.rectangle([bar_x, y + s(8), width - pad, y + s(16)], fill=(255, 255, 255, 40))
+    draw.rectangle([bar_x, y + s(8), bar_x + (width - pad - bar_x) * frac, y + s(16)],
+                   fill=colour)
 
-    view.paste(panel, (12, 12), panel)
+    view.paste(panel, (s(12), s(12)), panel)
 
 
-def draw_histogram(view: Image.Image, hist: np.ndarray) -> None:
+def draw_histogram(view: Image.Image, hist: np.ndarray, scale: float = 1.0) -> None:
     """RGB-Histogramm unten rechts, gefuellt damit es auch auf hellen Bildern liest."""
-    w, h = min(272, max(view.width - 24, 160)), 104
-    pad = 8
+    def s(value: float) -> int:
+        return round(value * scale)
+
+    w, h = min(s(272), max(view.width - s(24), s(160))), s(104)
+    pad = s(8)
     panel = Image.new("RGBA", (w, h), (0, 0, 0, 195))
     inner_w, inner_h = w - 2 * pad, h - 2 * pad
     peak = max(float(hist.max()), 1.0)
@@ -2285,12 +3044,31 @@ def draw_histogram(view: Image.Image, hist: np.ndarray) -> None:
         layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         pen = ImageDraw.Draw(layer)
         pen.polygon(points + [(w - pad, h - pad), (pad, h - pad)], fill=(r, g, b, 70))
-        pen.line(points, fill=(r, g, b, 235), width=2)
+        pen.line(points, fill=(r, g, b, 235), width=max(1, s(2)))
         panel = Image.alpha_composite(panel, layer)
 
     ImageDraw.Draw(panel).rectangle([pad, pad, w - pad, h - pad],
                                     outline=(255, 255, 255, 60))
-    view.paste(panel, (view.width - w - 12, view.height - h - 12), panel)
+    view.paste(panel, (view.width - w - s(12), view.height - h - s(12)), panel)
+
+
+def _enable_dpi_awareness() -> None:
+    """Unter Windows selbst skalieren statt vom System hochgerechnet zu werden.
+
+    Sonst vergroessert Windows bei 125/150 % das fertige Fenster - Schrift
+    und vor allem die Vorschau werden unscharf, was gerade beim Beurteilen
+    der Schaerfe stoert. Muss vor dem ersten Fenster passieren.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # systemweit DPI-bewusst
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()     # vor Windows 8.1
+        except (AttributeError, OSError):
+            pass
 
 
 def main() -> None:
@@ -2298,6 +3076,7 @@ def main() -> None:
         print("Hinweis: rawpy fehlt - RAW-Dateien werden nicht angezeigt.")
     if exifread is None:
         print("Hinweis: exifread fehlt - EXIF nur aus dem Vorschaubild.")
+    _enable_dpi_awareness()
     App().mainloop()
 
 
