@@ -26,7 +26,8 @@ or double-click `start.bat`.
    over to the next shoot.
 3. Browse with ←/→ and assign with **1–9**. Pressing the same key again clears
    the assignment.
-4. **Run assignments** copies (or moves) everything at once.
+4. **Run assignments** copies (or moves) everything at once. While it runs, the
+   button reads **Abbrechen** (cancel) — it stops after the current file.
 
 Nothing is ever deleted. Assignments live in `.photoselection.json` inside the
 source folder, so you can stop halfway through and pick up later.
@@ -35,7 +36,7 @@ source folder, so you can stop halfway through and pick up later.
 
 | Key | Effect |
 |---|---|
-| `1`–`9` | Assign the frame to that destination folder (press again to clear) |
+| `1`–`9` | Assign the frame to that destination folder (press again to clear), numeric keypad too |
 | `Space`, `Enter` | Assign to folder 1 and advance (again on the same frame clears it) |
 | `0`, `Del` | Clear the assignment |
 | `←` `→` | Browse · `PgUp` `PgDn` in steps of ten · `Home` `End` first/last |
@@ -44,7 +45,8 @@ source folder, so you can stop halfway through and pick up later.
 | `I` | Show/hide shooting data |
 | `H` | Histogram |
 | `J` | Clipping warning: blown highlights red, crushed shadows blue |
-| `Z` | Toggle fit ↔ 100 % (the wheel zooms freely, dragging pans) |
+| `Z` | Toggle fit ↔ true 100 % — full resolution is loaded in the background (the wheel zooms freely, dragging pans) |
+| `L` | Keep zoom and position while browsing — for comparing a burst |
 | `R` / `Shift+R` | Rotate the view |
 | `F`, `F11` | Full screen · `Esc` back |
 
@@ -54,7 +56,9 @@ source folder, so you can stop halfway through and pick up later.
   is read straight from the file via `exifread`; where that fails (Canon CR3,
   for instance) it comes from the embedded preview image.
 - **Sharpness score**: Laplacian variance over the middle 60 % of the frame, so
-  deliberate background blur doesn't drag it down. The bar is logarithmic;
+  deliberate background blur doesn't drag it down. It is always measured at a
+  1200 px long edge, so frames with differently sized previews stay
+  comparable. The bar is logarithmic;
   roughly 500 and up reads as crisp. Treat it as a way to *compare similar
   frames*, not as an absolute verdict — a low-texture subject scores low even
   when perfectly sharp.
@@ -68,18 +72,21 @@ Culling works without any of this — the panel stays hidden until you press `E`
 and JPG export is off by default.
 
 `E` opens the sliders on the right: exposure, white balance (camera / auto /
-Kelvin with tint), auto brightness, noise reduction, highlights, shadows,
+Kelvin with tint; 5500 K means daylight), auto brightness, noise reduction, highlights, shadows,
 contrast, saturation, sharpening. Below that the crop: aspect ratio,
 straightening, and `K` to drag out the crop rectangle (drag a corner to resize,
 drag inside to move). Double-clicking a slider resets it.
 
 Settings are non-destructive — the original files are never touched. They belong
 to the frame, are stored in `.photoselection.json`, and can be carried over to
-other frames with **Copy / Paste / Apply to all** (the crop stays
-frame-specific). Edited frames are marked with ✎ in the list.
+other frames with **Copy / Paste / Apply to all**. Crop, aspect ratio, rotation
+and straightening stay frame-specific. **Apply to all** covers every frame
+currently shown — use **Show** to narrow it down, e.g. to assigned frames only.
+Edited frames are marked with ✎ in the list.
 
-**Output:** the **Export…** dialog controls whether JPGs are developed when you
-run the assignments, along with quality and long edge. Two modes:
+**Output:** the **Export…** dialog controls whether RAWs and edited frames are
+developed to JPG when you run the assignments, along with quality and long
+edge. Unedited JPGs are not recompressed but copied as usual. Two modes:
 
 - *in addition to the RAW file* — originals go to the destination folder as
   usual, the developed JPGs into its `entwickelt` subfolder.
@@ -88,7 +95,9 @@ run the assignments, along with quality and long edge. Two modes:
   can be lost.
 
 Camera, lens, aperture, shutter and ISO are carried into the resulting JPG —
-location data is not, by default; see [Handling foreign data](#handling-foreign-data).
+location data and serial numbers are not, by default; see
+[Handling foreign data](#handling-foreign-data). An embedded colour profile
+(Adobe RGB, for instance) is converted to sRGB.
 Nothing is ever overwritten: if the name is taken, `_1`, `_2` … is appended.
 `Ctrl+Z` takes a whole run back.
 
@@ -131,9 +140,17 @@ Verified against Sony ARW, Canon CR2, Canon CR3 and DNG:
   `IMG_0001.JPG`) count as one frame and are copied together.
 - **Move** instead of copy — with a confirmation, and `Ctrl+Z` moves it back.
 - **Show** — filter to assigned, unassigned, or one particular folder.
+- **Sort** — by name (`IMG_2` before `IMG_10`) or by file date.
 
-If a file already exists in the destination at the same size it is skipped; at a
-different size, `_1`, `_2` … is appended.
+**Sidecar files travel along:** `IMG_0001.xmp`, `IMG_0001.CR2.xmp`, `.thm`,
+`.dop` (DxO) and `.pp3` (RawTherapee) are copied or moved together with their
+frame, so other programs still find their edits. The list then shows e.g.
+`[CR2+JPG] +XMP`.
+
+If a file with identical content already exists in the destination it is
+skipped. Otherwise the whole frame moves to `_1`, `_2` … together, so RAW, JPG
+and XMP keep matching. Size alone is not a valid comparison — uncompressed RAWs
+from one camera are all the same size.
 
 ## How it works
 
@@ -148,29 +165,51 @@ completely and then shrinking, `Image.draft()` asks libjpeg to do the reduction
 during decoding — measured on real files: Canon CR2 867 → 144 ms, Canon CR3
 1198 → 196 ms. Every format tested now stays under 200 ms per frame.
 
+For the **100 % view**, full resolution is loaded in the background: the file
+itself for JPG; for RAW the embedded preview if it is sensor-sized, otherwise a
+full development (that takes a few seconds, with "lade 100 %…" shown at the
+bottom). Until then the preview is enlarged.
+
+On Windows the program declares itself DPI-aware. At 125 or 150 % display
+scaling the preview therefore stays pixel-accurate instead of being blurrily
+upscaled by Windows.
+
 Without `rawpy` the program still runs but shows only JPG/TIF/PNG. Without
-`exifread`, shooting data comes from the preview image alone.
+`exifread`, shooting data comes from the preview image alone. With the optional
+`pillow-heif`, HEIC/HEIF/HIF are read as well.
+
+Unexpected errors are shown once as a message and logged in full to
+`~/.photoselection.log` — `start.bat` runs without a console window, where they
+would otherwise vanish.
 
 ## Handling foreign data
 
 The program reads folders of foreign origin — memory cards, network shares,
 folders someone handed you — and writes, moves and deletes files. Accordingly:
 
-- **Nothing is ever overwritten.** If the destination file exists at the same
-  size it is skipped; otherwise `_1`, `_2` … is appended.
+- **Nothing is ever overwritten.** If the destination file exists with the
+  same content it is skipped; otherwise `_1`, `_2` … is appended. Copies and
+  developed JPGs are first written under a temporary name (`.name.part`) and
+  only renamed once complete — an interruption leaves no half-written files.
 - **Undo checks first.** A file at the destination path is removed only if it is
-  still exactly the one this run created. If it has been replaced in the
-  meantime it stays, and the status bar says so.
+  still exactly the one this run created (size, timestamp and file ID). If it
+  has been replaced in the meantime it stays, and the status bar says so. If a
+  different file now sits at the original location, the moved file stays in the
+  destination.
 - **Folders are removed only if the run created them.** Destination folders and
   pre-existing subfolders are left alone.
 - **`.photoselection.json` is validated strictly.** It sits in the source folder
   and travels with it, so it may be corrupted or crafted. Values that don't fit
-  fall back to the default instead of taking the program down.
-- **Location data is stripped from exports by default.** Camera, lens, aperture,
-  shutter and ISO are kept, GPS is not — an exported JPG is the thing you hand
-  out. Switchable in the Export dialog.
-- The scan stays inside the source folder; directory links are not followed, and
-  paths from the assignment file cannot escape it.
+  fall back to the default instead of taking the program down. It is written
+  atomically — a crash midway leaves the old or the new version, never half of
+  one. Entries for files not currently read in (in subfolders, say) are kept.
+- **Location data and serial numbers are stripped from exports by default.**
+  Camera, lens, aperture, shutter and ISO are kept; GPS, owner name, body and
+  lens serial numbers and the MakerNote are not — an exported JPG is the thing
+  you hand out. Switchable in the Export dialog.
+- The scan stays inside the source folder; links (symlinks and Windows
+  junctions) are not followed, and paths from the assignment file cannot escape
+  it.
 
 Image formats are parsed by Pillow and LibRaw — that is the real attack surface
 for files of unknown origin. Keep both current via
@@ -179,5 +218,15 @@ for files of unknown origin. Keep both current via
 ## Configuration
 
 - `.photoselection.json` in the source folder — that folder's assignments.
-- `~/.photoselection_slots.json` — the nine destination folders and their names,
-  global.
+- `~/.photoselection_slots.json` — the nine destination folders and their names
+  plus the export settings, global.
+- `~/.photoselection.log` — error log.
+
+## Tests
+
+```
+pip install pytest
+python -m pytest tests
+```
+
+The UI tests briefly open hidden windows; without a display they are skipped.

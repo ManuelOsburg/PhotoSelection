@@ -27,6 +27,8 @@ oder `start.bat` doppelklicken.
 3. Mit ←/→ durchblättern und mit **1–9** zuordnen. Nochmal dieselbe Taste hebt
    die Zuordnung wieder auf.
 4. **Zuordnungen ausführen** kopiert (oder verschiebt) alles auf einmal.
+   Solange das läuft, heißt der Knopf **Abbrechen** — angehalten wird nach der
+   aktuellen Datei.
 
 Es wird nie gelöscht. Zuordnungen landen in `.photoselection.json` im
 Quellordner — du kannst die Sichtung jederzeit unterbrechen und fortsetzen.
@@ -35,7 +37,7 @@ Quellordner — du kannst die Sichtung jederzeit unterbrechen und fortsetzen.
 
 | Taste | Wirkung |
 |---|---|
-| `1`–`9` | Bild dem jeweiligen Zielordner zuordnen (nochmal drücken = aufheben) |
+| `1`–`9` | Bild dem jeweiligen Zielordner zuordnen (nochmal drücken = aufheben), auch über den Ziffernblock |
 | `Leertaste`, `Enter` | Ordner 1 zuordnen und zum nächsten Bild (nochmal auf demselben Bild = aufheben) |
 | `0`, `Entf` | Zuordnung aufheben |
 | `←` `→` | Blättern · `Bild↑` `Bild↓` in Zehnerschritten · `Pos1` `Ende` Anfang/Ende |
@@ -44,7 +46,8 @@ Quellordner — du kannst die Sichtung jederzeit unterbrechen und fortsetzen.
 | `I` | Aufnahmedaten ein-/ausblenden |
 | `H` | Histogramm |
 | `J` | Clipping-Warnung: ausgefressene Lichter rot, abgesoffene Schatten blau |
-| `Z` | Zwischen Einpassen und 100 % umschalten (Mausrad zoomt stufenlos, Ziehen schwenkt) |
+| `Z` | Zwischen Einpassen und echten 100 % umschalten — die volle Auflösung wird im Hintergrund nachgeladen (Mausrad zoomt stufenlos, Ziehen schwenkt) |
+| `L` | Zoom und Ausschnitt beim Blättern beibehalten — zum Vergleichen von Serien |
 | `R` / `Umschalt+R` | Ansicht drehen |
 | `F`, `F11` | Vollbild · `Esc` zurück |
 
@@ -54,7 +57,9 @@ Quellordner — du kannst die Sichtung jederzeit unterbrechen und fortsetzen.
   werden per `exifread` direkt aus der Datei gelesen; wo das nicht geht
   (z. B. Canon CR3), aus dem eingebetteten Vorschaubild.
 - **Schärfe-Score**: Laplace-Varianz der mittleren 60 % des Bildes — Bokeh am
-  Rand verfälscht das Ergebnis also nicht. Der Balken ist logarithmisch
+  Rand verfälscht das Ergebnis also nicht. Gemessen wird immer bei 1200 px
+  Kantenlänge, damit Aufnahmen mit unterschiedlich großen Vorschaubildern
+  vergleichbar bleiben. Der Balken ist logarithmisch
   skaliert; ab etwa 500 ist eine Aufnahme knackig. Der Wert ist zum *Vergleich
   ähnlicher Aufnahmen* gedacht, nicht als absolutes Urteil: ein Motiv mit wenig
   Struktur liegt auch scharf niedrig.
@@ -67,7 +72,7 @@ Das Sichten funktioniert ohne das alles — der Bereich ist ausgeblendet, bis du
 `E` drückst, und der JPG-Export ist ab Werk aus.
 
 `E` öffnet rechts die Regler: Belichtung, Weißabgleich (Kamera / Auto / Kelvin
-mit Tönung), Auto-Helligkeit, Rauschminderung, Lichter, Schatten, Kontrast,
+mit Tönung; 5500 K entspricht Tageslicht), Auto-Helligkeit, Rauschminderung, Lichter, Schatten, Kontrast,
 Sättigung, Schärfen. Darunter der Zuschnitt: Seitenverhältnis, Geraderichten und
 `K` zum Aufziehen des Ausschnitts (Ecken ziehen zum Ändern, innen ziehen zum
 Verschieben). Doppelklick auf einen Regler setzt ihn zurück.
@@ -75,11 +80,15 @@ Verschieben). Doppelklick auf einen Regler setzt ihn zurück.
 Die Einstellungen sind nicht-destruktiv — an den Originaldateien ändert sich
 nichts. Sie gehören zur Aufnahme, werden in `.photoselection.json` gespeichert
 und lassen sich mit **Kopieren / Einfügen / Auf alle** auf andere Aufnahmen
-übertragen (der Zuschnitt bleibt dabei bildspezifisch). Bearbeitete Aufnahmen
-sind in der Liste mit ✎ markiert.
+übertragen. Zuschnitt, Seitenverhältnis, Drehung und Geraderichten bleiben dabei
+bildspezifisch. **Auf alle** gilt für alle angezeigten Aufnahmen — über
+**Anzeigen** lässt es sich z. B. auf die zugeordneten beschränken. Bearbeitete
+Aufnahmen sind in der Liste mit ✎ markiert.
 
 **Ausgabe:** Über **Export…** legst du fest, ob beim Ausführen der Zuordnungen
-JPGs entwickelt werden, dazu Qualität und lange Kante. Zwei Betriebsarten:
+RAWs und bearbeitete Aufnahmen als JPG entwickelt werden, dazu Qualität und
+lange Kante. Unbearbeitete JPGs werden nicht neu komprimiert, sondern wie
+gewohnt kopiert. Zwei Betriebsarten:
 
 - *zusätzlich zur RAW-Datei* — Originale wandern wie gewohnt in den Zielordner,
   die entwickelten JPGs in dessen Unterordner `entwickelt`.
@@ -88,7 +97,9 @@ JPGs entwickelt werden, dazu Qualität und lange Kante. Zwei Betriebsarten:
   nichts verloren.
 
 Kamera, Objektiv, Blende, Zeit und ISO werden in die erzeugte JPG übernommen —
-Standortdaten standardmäßig nicht, siehe [Umgang mit fremden Daten](#umgang-mit-fremden-daten).
+Standortdaten und Seriennummern standardmäßig nicht, siehe
+[Umgang mit fremden Daten](#umgang-mit-fremden-daten). Ein eingebettetes
+Farbprofil (z. B. Adobe RGB) wird nach sRGB umgerechnet.
 Überschrieben wird nie: existiert der Name schon, wird `_1`, `_2` … angehängt.
 `Strg+Z` nimmt einen kompletten Durchlauf wieder zurück.
 
@@ -132,9 +143,17 @@ Geprüft an Sony ARW, Canon CR2, Canon CR3 und DNG:
   `IMG_0001.JPG`) gelten als eine Aufnahme und werden gemeinsam kopiert.
 - **Verschieben** statt kopieren — mit Rückfrage, und `Strg+Z` schiebt zurück.
 - **Anzeigen** — Filter auf zugeordnete, offene oder einen bestimmten Ordner.
+- **Sortierung** — nach Name (`IMG_2` vor `IMG_10`) oder nach Dateidatum.
 
-Existiert eine Datei im Ziel bereits und ist gleich groß, wird sie
-übersprungen; bei abweichender Größe wird `_1`, `_2` … angehängt.
+**Begleitdateien** wandern mit: `IMG_0001.xmp`, `IMG_0001.CR2.xmp`, `.thm`,
+`.dop` (DxO) und `.pp3` (RawTherapee) werden zusammen mit ihrer Aufnahme kopiert
+oder verschoben, damit andere Programme ihre Bearbeitung wiederfinden. In der
+Liste steht dann z. B. `[CR2+JPG] +XMP`.
+
+Existiert eine Datei im Ziel bereits mit identischem Inhalt, wird sie
+übersprungen. Sonst weicht die ganze Aufnahme gemeinsam auf `_1`, `_2` … aus,
+damit RAW, JPG und XMP weiter zusammenpassen. Die Größe allein reicht als
+Vergleich nicht — unkomprimierte RAWs einer Kamera sind alle gleich groß.
 
 ## Technik
 
@@ -151,29 +170,54 @@ Verkleinerung direkt von libjpeg an — gemessen auf echten Dateien: Canon CR2
 867 → 144 ms, Canon CR3 1198 → 196 ms. Alle geprüften Formate liegen damit
 unter 200 ms pro Bild.
 
+Für die **100-%-Ansicht** wird die volle Auflösung im Hintergrund nachgeladen:
+bei JPG die Datei selbst, bei RAW das eingebettete Vorschaubild, sofern es
+Sensorgröße hat, sonst eine volle Entwicklung (das dauert einige Sekunden,
+unten steht solange „lade 100 %…“). Bis dahin wird die Vorschau vergrößert.
+
+Unter Windows meldet sich das Programm als DPI-bewusst. Bei 125 oder 150 %
+Anzeigeskalierung bleibt die Vorschau damit pixelgenau, statt von Windows
+unscharf hochgerechnet zu werden.
+
 Ohne `rawpy` läuft das Programm weiter, zeigt dann aber nur JPG/TIF/PNG. Ohne
-`exifread` kommen die Aufnahmedaten nur aus dem Vorschaubild.
+`exifread` kommen die Aufnahmedaten nur aus dem Vorschaubild. Mit dem
+optionalen `pillow-heif` werden auch HEIC/HEIF/HIF gelesen.
+
+Unerwartete Fehler erscheinen einmal als Meldung und landen vollständig in
+`~/.photoselection.log` — `start.bat` startet ohne Konsolenfenster, dort wäre
+sonst nichts zu sehen.
 
 ## Umgang mit fremden Daten
 
 Das Programm liest Ordner fremder Herkunft — Speicherkarten, Netzlaufwerke,
 geteilte Ordner — und schreibt, verschiebt und löscht Dateien. Entsprechend:
 
-- **Nichts wird überschrieben.** Gibt es die Zieldatei schon und ist gleich
-  groß, wird übersprungen; sonst wird `_1`, `_2` … angehängt.
+- **Nichts wird überschrieben.** Gibt es die Zieldatei schon mit gleichem
+  Inhalt, wird übersprungen; sonst wird `_1`, `_2` … angehängt. Kopien und
+  entwickelte JPGs entstehen zuerst unter einem Hilfsnamen (`.name.part`) und
+  bekommen ihren Namen erst, wenn sie vollständig sind — ein Abbruch
+  hinterlässt keine halben Dateien.
 - **Rückgängig prüft vorher nach.** Eine Datei am Zielpfad wird nur entfernt,
-  wenn sie noch genau die ist, die dieser Vorgang erzeugt hat. Wurde sie
-  inzwischen ersetzt, bleibt sie liegen und die Statuszeile sagt es.
+  wenn sie noch genau die ist, die dieser Vorgang erzeugt hat (Größe,
+  Zeitstempel und Datei-ID). Wurde sie inzwischen ersetzt, bleibt sie liegen
+  und die Statuszeile sagt es. Liegt beim Zurückschieben am Ursprungsort
+  inzwischen eine andere Datei, bleibt die verschobene im Ziel.
 - **Ordner werden nur entfernt, wenn der Vorgang sie selbst angelegt hat.**
   Zielordner und vorher vorhandene Unterordner bleiben stehen.
 - **Die `.photoselection.json` wird streng geprüft.** Sie liegt im Quellordner
   und reist mit ihm mit, kann also beschädigt oder präpariert sein. Unpassende
   Werte fallen auf den Standard zurück, statt das Programm abzureißen.
-- **Standortdaten werden beim Export standardmäßig entfernt.** Kamera,
-  Objektiv, Blende, Zeit und ISO bleiben erhalten, GPS nicht — exportierte JPGs
-  sind das, was man weitergibt. Im Export-Dialog abschaltbar.
-- Der Scan bleibt im Quellordner; Verzeichnis-Verknüpfungen werden nicht
-  verfolgt, und Pfade aus der Zuordnungsdatei können nicht aus ihm ausbrechen.
+  Geschrieben wird sie atomar — ein Absturz mittendrin lässt die alte oder
+  die neue Fassung zurück, nie eine halbe. Einträge zu Dateien, die gerade
+  nicht eingelesen sind (z. B. in Unterordnern), bleiben erhalten.
+- **Standortdaten und Seriennummern werden beim Export standardmäßig
+  entfernt.** Kamera, Objektiv, Blende, Zeit und ISO bleiben erhalten; GPS,
+  Besitzername, Seriennummern von Kamera und Objektiv sowie die MakerNote
+  nicht — exportierte JPGs sind das, was man weitergibt. Im Export-Dialog
+  abschaltbar.
+- Der Scan bleibt im Quellordner; Verknüpfungen (Symlinks und
+  Windows-Junctions) werden nicht verfolgt, und Pfade aus der Zuordnungsdatei
+  können nicht aus ihm ausbrechen.
 
 Bildformate werden von Pillow und LibRaw geparst — das ist die eigentliche
 Angriffsfläche bei Dateien unbekannter Herkunft. Beide über
@@ -182,4 +226,16 @@ Angriffsfläche bei Dateien unbekannter Herkunft. Beide über
 ## Konfiguration
 
 - `.photoselection.json` im Quellordner — die Zuordnungen dieses Ordners.
-- `~/.photoselection_slots.json` — die neun Zielordner samt Namen, global.
+- `~/.photoselection_slots.json` — die neun Zielordner samt Namen und die
+  Export-Einstellungen, global.
+- `~/.photoselection.log` — Fehlerprotokoll.
+
+## Tests
+
+```
+pip install pytest
+python -m pytest tests
+```
+
+Die Oberflächen-Tests öffnen kurz unsichtbare Fenster; ohne Bildschirm werden
+sie übersprungen.

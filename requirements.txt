@@ -2,3 +2,4 @@ Pillow>=10.0
 numpy>=1.24
 rawpy>=0.19      # optional - ohne rawpy werden nur JPG/TIF/PNG angezeigt
 exifread>=3.0    # optional - ohne exifread kommt EXIF nur aus dem Vorschaubild
+pillow-heif>=0.16  # optional - HEIC/HEIF/HIF; ohne werden diese Dateien nicht angezeigt
