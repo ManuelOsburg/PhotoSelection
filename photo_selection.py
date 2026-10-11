@@ -1224,8 +1224,10 @@ class App(tk.Tk):
         ttk.Checkbutton(bar, text="Verschieben",
                         variable=self.move_files).pack(side=tk.RIGHT)
 
-        self.pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        self.pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        main = ttk.Frame(self)
+        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.pane = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        self.pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         left = ttk.Frame(self.pane)
         self._build_slot_panel(left)
@@ -1254,7 +1256,7 @@ class App(tk.Tk):
         self.canvas.bind("<MouseWheel>", self._on_wheel)
         self.pane.add(centre, weight=1)
 
-        self.dev_panel = self._build_dev_panel(self.pane)
+        self.dev_panel = self._build_dev_panel(main)
 
         # Die Trennlinie erst setzen, wenn die Leiste wirklich Breite hat -
         # vorher wird sashpos auf 0 begrenzt und die linke Leiste mit den
@@ -1982,12 +1984,14 @@ class App(tk.Tk):
     def toggle_develop(self) -> None:
         self.dev_mode.set(not self.dev_mode.get())
         if self.dev_mode.get():
-            self.pane.add(self.dev_panel, weight=0)
-            self.after(50, lambda: self.pane.sashpos(1, self.pane.winfo_width() - self.px(280)))
+            # Neben das PanedWindow, nicht hinein: dort stellte dessen
+            # Platzverteilung die gesetzte Trennlinie wieder zurueck und das
+            # Panel blieb schmal. So bekommt es immer die Breite seines Inhalts.
+            self.dev_panel.pack(side=tk.RIGHT, fill=tk.Y, before=self.pane)
             self._sync_dev_panel()
         else:
             self.crop_mode.set(False)
-            self.pane.forget(self.dev_panel)
+            self.dev_panel.pack_forget()
         self.show_current()
 
     def toggle_crop(self) -> None:

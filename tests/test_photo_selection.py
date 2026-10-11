@@ -398,6 +398,18 @@ class TestGui(GuiTest):
         self.assertTrue((dest / "IMG_1.jpg").exists())
         self.assertIn("im Ziel gelassen", self.app.status.cget("text"))
 
+    def test_develop_panel_gets_its_width(self):
+        # Im PanedWindow wurde die Trennlinie zurueckgestellt - Panel 1 px breit
+        for i in range(3):
+            noise_jpeg(self.source / f"IMG_{i}.jpg", size=(1200, 800), seed=i)
+        self.app.deiconify()
+        self.open_source()
+        self.app.toggle_develop()
+        self.pump(1.5)
+        panel = self.app.dev_panel
+        self.assertGreaterEqual(panel.winfo_width(), panel.winfo_reqwidth())
+        self.assertGreater(panel.winfo_width(), 100)
+
     def test_sidecar_travels_with_image(self):
         noise_jpeg(self.source / "IMG_1.jpg")
         (self.source / "IMG_1.xmp").write_text("<x/>", encoding="utf-8")
